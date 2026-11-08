@@ -319,11 +319,16 @@ int `DataVersion` (0 when it has none).
 
 A reader MUST verify a whole root (every check of section 3) before using any part of it.
 
-A checker tells an object that does not exist from one it could not read. A root, segment, dictionary or base snapshot
-(or a base frame a ZSTD_BASE_DELTA entry needs) that the store answers definitely does not exist is a dangling
-reference, which is corruption, as is one that exists but fails its checks. One whose read failed (timeout, connection
-error, server error) is never reported as damage: it makes the report incomplete, which means "re-run the check to
-cover it". The checker itself does not retry.
+A checker tells an object that does not exist from one it could not read. A root, segment or base snapshot (or a base
+frame a ZSTD_BASE_DELTA entry needs) that the store answers definitely does not exist is a dangling reference, which is
+corruption, as is one that exists but fails its checks. One whose read failed (timeout, connection error, server error)
+is never reported as damage: it makes the report incomplete, which means "re-run the check to cover it". The checker
+itself does not retry.
+
+A dictionary is a shared object, not part of the world that lists it (section 8). A checker reports a dictionary that
+does not exist or could not be read as unavailable, and one that was read but fails its SHA-256 (or does not load as a
+dictionary) as a damaged dictionary, naming it; neither is corruption of the world. The frames that need it are
+unchecked, and a reader still fails closed: it MUST NOT decode them without it, nor treat the world as empty.
 
 ## 7. Light and heightmap policy
 

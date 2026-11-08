@@ -2,6 +2,7 @@ package gg.netherite.world.nwf.codec
 
 import gg.netherite.world.nwf.ChunkKey
 import gg.netherite.world.nwf.ChunkKind
+import gg.netherite.world.nwf.DictRef
 import gg.netherite.world.nwf.DictionaryLookup
 import gg.netherite.world.nwf.EncodedFrame
 import gg.netherite.world.nwf.FrameCodec
@@ -47,9 +48,12 @@ fun interface BaseFrameLookup {
  * server never validates them and writers accept them, so the frame still counts as decoded.
  * ZSTD_BASE_DELTA frames need the base: without a [BaseFrameLookup] they are CRC-checked only and not counted as
  * decoded; with one, a missing base frame is [FsckIssueCode.BASE_MISSING], a damaged one [FsckIssueCode.BASE_INVALID]
- * and an unreadable one [FsckIssueCode.BASE_UNREADABLE]. Dictionaries follow the same rule through [DictionaryLookup]:
- * [FsckIssueCode.DICTIONARY_MISSING], [FsckIssueCode.DICTIONARY_INVALID] (including bytes that differ from the
- * dictionary's SHA-256) or [FsckIssueCode.DICTIONARY_UNREADABLE]; each slot is looked up once. Frames present in a
+ * and an unreadable one [FsckIssueCode.BASE_UNREADABLE]. Dictionaries are shared objects, not part of the world (SPEC
+ * 6): through [DictionaryLookup] a missing one is [FsckIssueCode.DICTIONARY_MISSING] and an unreadable one
+ * [FsckIssueCode.DICTIONARY_UNREADABLE] (both [gg.netherite.world.nwf.FsckSeverity.UNAVAILABLE]), and one whose bytes
+ * differ from its SHA-256 or do not load is [FsckIssueCode.DICTIONARY_INVALID]
+ * ([gg.netherite.world.nwf.FsckSeverity.DICTIONARY_DAMAGED]); none of them is world corruption, and each issue names
+ * the dictionary's SHA-256. Each slot is looked up once. Frames present in a
  * segment but referenced by no INDEX entry are [FsckIssueCode.ORPHAN_FRAME]; a segment written by an earlier commit
  * legitimately keeps frames that later commits superseded, so that code is informational and [FsckReport.clean]
  * ignores it. A segment fetch that throws is [FsckIssueCode.SEGMENT_UNREADABLE] (the report is incomplete, not
@@ -75,7 +79,7 @@ class NwfV1Fsck(
         } catch (e: NwfFormatException) {
             return FsckReport.rootNotChecked(FsckIssueCode.ROOT_INVALID, e.message.orEmpty())
         }
-        val run = CheckRun(dictionaries, base)
+        val run = CheckRun(dictionaries, base, view.dictionaries)
         val bySegment = HashMap<Int, MutableList<IndexEntry>>()
         for (i in 0 until view.entryCount) {
             val entry = try {
@@ -141,7 +145,11 @@ class NwfV1Fsck(
         return latest.values.sortedBy { it.key }
     }
 
-    private inner class CheckRun(private val dictionaries: DictionaryLookup, private val base: BaseFrameLookup?) {
+    private inner class CheckRun(
+        private val dictionaries: DictionaryLookup,
+        private val base: BaseFrameLookup?,
+        private val dictionaryRefs: List<DictRef>,
+    ) {
         val issues = ArrayList<FsckIssue>()
         var decoded = 0
 
@@ -227,7 +235,9 @@ class NwfV1Fsck(
                         Unit
                     }
                     is DictOutcome.NotUsable -> {
-                        issue(outcome.code, entry.key, "dictionary slot ${entry.dictSlot}: ${outcome.detail}")
+                        val sha = dictionaryRefs.getOrNull(entry.dictSlot)?.sha256
+                        val detail = "dictionary slot ${entry.dictSlot} (${sha ?: "undefined"}): ${outcome.detail}"
+                        issues += FsckIssue(outcome.code, entry.key, detail, sha)
                         return
                     }
                 }

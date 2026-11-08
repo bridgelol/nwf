@@ -295,15 +295,19 @@ class NwfV1WorldBuilderAndFsckTest {
     }
 
     @Test
-    fun `dictionaries follow the absent, invalid and unreadable rule, one lookup per slot`() {
+    fun `dictionaries are unavailable or damaged, never world corruption, one lookup per slot`() {
         val world = segmented()
         val root = ByteBuffer.wrap(rootCodec.write(world.root))
         val segments = world.segments.map { it.bytes() }
         fun check(dicts: DictionaryLookup) = fsck.check(root.duplicate(), fetcher(segments), dicts)
 
+        val dictSha = world.root.dictionaries.single().sha256
         val missing = check(NO_DICTS)
         assertEquals(setOf(FsckIssueCode.DICTIONARY_MISSING), missing.issues.map { it.code }.toSet())
-        assertTrue(missing.corrupt)
+        assertTrue(!missing.corrupt, "a missing dictionary is not damage to the world")
+        assertTrue(missing.unavailable)
+        assertTrue(!missing.complete, "its frames are unchecked")
+        assertEquals(setOf(dictSha), missing.dictionariesNotUsable, "the issue names the dictionary")
 
         var lookups = 0
         val unreadable = check {
@@ -312,20 +316,24 @@ class NwfV1WorldBuilderAndFsckTest {
         }
         assertEquals(setOf(FsckIssueCode.DICTIONARY_UNREADABLE), unreadable.issues.map { it.code }.toSet())
         assertTrue(!unreadable.corrupt)
+        assertTrue(unreadable.unavailable)
         assertTrue(!unreadable.complete)
         assertEquals(1, lookups, "each slot is looked up once")
 
         val invalid = check { throw NwfFormatException(NwfFormatError.SHA_MISMATCH, "dictionary bytes differ") }
         assertEquals(setOf(FsckIssueCode.DICTIONARY_INVALID), invalid.issues.map { it.code }.toSet())
-        assertTrue(invalid.corrupt)
-        assertTrue(invalid.complete)
+        assertTrue(!invalid.corrupt, "a damaged dictionary is the dictionary's damage, not the world's")
+        assertTrue(invalid.dictionaryDamaged)
+        assertTrue(!invalid.complete)
+        assertEquals(setOf(dictSha), invalid.dictionariesNotUsable)
 
         // A lookup that hands back bytes that do not match the dictionary's SHA-256 is invalid too.
         val good = TestDictionaries.chunk
         val tampered = good.bytes().also { it[it.size / 2] = (it[it.size / 2].toInt() xor 1).toByte() }
         val wrong = check { gg.netherite.world.nwf.NwfDictionary(good.sha256, good.zstdDictId, tampered) }
         assertEquals(setOf(FsckIssueCode.DICTIONARY_INVALID), wrong.issues.map { it.code }.toSet())
-        assertTrue(wrong.corrupt)
+        assertTrue(!wrong.corrupt)
+        assertTrue(wrong.dictionaryDamaged)
 
         assertTrue(check(lookupOf(good)).clean)
 

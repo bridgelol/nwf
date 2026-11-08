@@ -112,9 +112,10 @@ val chunk: ByteBuffer = pipeline.decode(segmentFrame, DictionaryLookup { null },
 
 `NwfV1Fsck` checks a whole world offline. Each issue has a severity: `FsckReport.clean` means nothing but informational
 issues (such as frames a later commit superseded), `corrupt` means damage, and `complete` is false when a segment,
-dictionary or base frame could not be read. One rule covers every referenced object: one the store says does not
-exist is damage (a dangling reference, `*_MISSING`), one that exists but is damaged is `*_INVALID`, and one whose read
-failed only makes the report incomplete (`*_UNREADABLE`). `SegmentFetcher`, `DictionaryLookup` and `BaseFrameLookup`
+dictionary or base frame could not be read. One rule covers segments and bases: one the store says does not exist is
+damage (a dangling reference, `*_MISSING`), one that exists but is damaged is `*_INVALID`, and one whose read failed
+only makes the report incomplete (`*_UNREADABLE`). Dictionaries are shared objects, so a missing or unreadable one is
+`UNAVAILABLE` and a damaged one `DICTIONARY_DAMAGED` (each naming the dictionary), never world corruption. `SegmentFetcher`, `DictionaryLookup` and `BaseFrameLookup`
 signal these as null, `NwfFormatException` and `IOException`; any other exception is a defect and propagates. An
 incomplete report means "re-run the check"; the checker does not retry by itself. A caller that fetches the root itself reports a failed fetch with
 `FsckReport.rootNotChecked(ROOT_UNREADABLE, ...)` and an absent root with `ROOT_MISSING`. A POI record outside its

@@ -25,8 +25,8 @@ class NwfDictionary(val sha256: Sha256, val zstdDictId: Int, bytes: ByteArray) {
  * The contract matches [SegmentFetcher]: null only when the dictionary definitely does not exist or the root does not
  * define the slot; [NwfFormatException] when it exists but is damaged (for example its bytes differ from its SHA-256);
  * [java.io.IOException] when it could not be read. Decoding fails closed in every case. [NwfFsck.check] reports them as
- * DICTIONARY_MISSING, DICTIONARY_INVALID (both corruption) and DICTIONARY_UNREADABLE (incomplete); any other exception
- * is a defect and propagates.
+ * DICTIONARY_MISSING and DICTIONARY_UNREADABLE (unavailable: retry once it is readable) and DICTIONARY_INVALID
+ * (a damaged dictionary), never as world corruption; any other exception is a defect and propagates.
  */
 fun interface DictionaryLookup {
     /** The dictionary for [slot], or null when it does not exist. */
