@@ -153,6 +153,27 @@ class NwfV1RootCodecTest {
     }
 
     @Test
+    fun `a draft's packInlineLevel packs INLINE, and the parse decompresses it once, never per payload read`() {
+        val frames = sampleNbt().mapValues { (key, nbt) ->
+            pipeline.encode(key, ByteBuffer.wrap(nbt), options().copy(raw = true))
+        }
+        val packed = codec.write(inlineDraft(frames).copy(packInlineLevel = 3))
+        val before = NwfZstdCounters.decompressions()
+        val view = codec.parse(ByteBuffer.wrap(packed))
+        assertEquals(2, NwfZstdCounters.decompressions() - before, "INDEX and INLINE, once each")
+        assertTrue(view.isInlinePacked)
+        val afterParse = NwfZstdCounters.decompressions()
+        repeat(3) {
+            for (key in frames.keys) {
+                val entry = view.find(key)!!
+                pipeline.decode(EncodedFrame(NwfFrameHeaders.of(entry), entry.dataVersion, view.inlinePayload(entry)), NO_DICTS, null)
+            }
+        }
+        assertEquals(afterParse, NwfZstdCounters.decompressions(), "RAW frames of a packed root never decompress")
+        assertTrue(!codec.parse(ByteBuffer.wrap(codec.write(inlineDraft(frames)))).isInlinePacked, "no level: unpacked")
+    }
+
+    @Test
     fun `layout matches an independent assembly of the same sections`() {
         val bytes = codec.write(inlineDraft())
         val view = codec.parse(ByteBuffer.wrap(bytes))

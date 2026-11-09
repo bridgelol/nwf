@@ -3,6 +3,7 @@ package gg.netherite.world.nwf.codec
 import gg.netherite.world.nwf.ChunkKey
 import gg.netherite.world.nwf.ChunkKind
 import gg.netherite.world.nwf.DictRef
+import gg.netherite.world.nwf.DictionaryLookup
 import gg.netherite.world.nwf.EncodedFrame
 import gg.netherite.world.nwf.EntryFlags
 import gg.netherite.world.nwf.FrameCodec
@@ -87,6 +88,7 @@ class NwfV1WorldBuilderFactory(
             require(options.inlineBudgetBytes >= 0) { "inlineBudgetBytes ${options.inlineBudgetBytes}" }
             require(options.segmentTargetBytes > 0) { "segmentTargetBytes ${options.segmentTargetBytes}" }
             require(options.maxHeldBytes > 0) { "maxHeldBytes ${options.maxHeldBytes}" }
+            require(options.packInlineMaxRawBytes >= 0) { "packInlineMaxRawBytes ${options.packInlineMaxRawBytes}" }
             options.base?.let { base ->
                 if (base.hasBase) throw NwfFormatException(NwfFormatError.NESTED_BASE, "a base must not have a base")
                 if (!base.isTemplate) {
@@ -144,7 +146,14 @@ class NwfV1WorldBuilderFactory(
             val tombstones = baseTombstones()
             val indexBytes = (frames.size + tombstones.size).toLong() * NwfFormat.INDEX_ENTRY_BYTES
             val frameBytes = frames.values.sumOf { it.header.storedLength.toLong() }
-            val placed = if (frameBytes + indexBytes <= options.inlineBudgetBytes) placeInline() else placeSegmented()
+            val rawBytes = frames.values.sumOf { it.header.rawLength.toLong() }
+            val packed = options.packInlineMaxRawBytes > 0 && rawBytes <= options.packInlineMaxRawBytes &&
+                rawBytes + indexBytes <= options.inlineBudgetBytes
+            val placed = when {
+                packed -> placeInline(rawFrames())
+                frameBytes + indexBytes <= options.inlineBudgetBytes -> placeInline(frames.values)
+                else -> placeSegmented()
+            }
             val entries = (placed.entries + tombstones).sortedBy { it.key }
             val base = options.base
             val draft = RootDraft(
@@ -155,14 +164,41 @@ class NwfV1WorldBuilderFactory(
                 segments = placed.segments.map { SegmentRef(it.sha256, 0, it.length, it.frameOffsets.size) },
                 entries = entries,
                 inline = ByteBuffer.wrap(placed.inline),
+                packInlineLevel = options.packInlineLevel.takeIf { packed },
             )
             rootCodec.write(draft) // fails closed on any limit or reference breach before the caller PUTs anything
             return BuiltWorld(draft, placed.segments)
         }
 
-        private fun placeInline(): Placement {
+        /**
+         * Every held frame decoded back to its stored NBT as a RAW frame (codec RAW, no dictionary, CRC32C over the raw
+         * payload), flags and DataVersion kept: the frames of a packed root. The frames were encoded by this builder,
+         * so their dictionaries are this world's kind dictionaries.
+         */
+        private fun rawFrames(): List<EncodedFrame> {
+            val bySlot = kindSlots.entries.associate { (kind, slot) -> slot to options.dictionaries.getValue(kind) }
+            val lookup = DictionaryLookup { slot -> bySlot[slot] }
+            return frames.values.map { frame ->
+                if (frame.header.codec == FrameCodec.RAW) return@map frame
+                val raw = pipeline.decode(frame, lookup, null).copyRemaining()
+                val h = frame.header
+                EncodedFrame(
+                    h.copy(
+                        codec = FrameCodec.RAW,
+                        rawLength = raw.size,
+                        storedLength = raw.size,
+                        crc32c = crc32c(raw),
+                        dictSlot = NwfFormat.NONE_U16,
+                    ),
+                    frame.dataVersion,
+                    ByteBuffer.wrap(raw),
+                )
+            }
+        }
+
+        private fun placeInline(placedFrames: Collection<EncodedFrame>): Placement {
             val inline = ByteArrayOutputStream()
-            val entries = frames.values.map { frame ->
+            val entries = placedFrames.map { frame ->
                 val offset = inline.size()
                 inline.write(frame.payloadView().copyRemaining())
                 entryOf(frame, NwfFormat.NONE_U16, offset)

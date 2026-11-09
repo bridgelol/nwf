@@ -29,6 +29,12 @@ interface RootView {
     /** Length of the INLINE body in bytes, 0 when absent. */
     val inlineLength: Long
 
+    /**
+     * True when INLINE is stored as one zstd stream (packed inline, SPEC 3.8). [inlineLength] is then the decoded
+     * length, which the reader decompressed once when it parsed the root.
+     */
+    val isInlinePacked: Boolean get() = false
+
     val isTemplate: Boolean get() = flags and NwfFormat.ROOT_FLAG_TEMPLATE != 0
     val hasBase: Boolean get() = flags and NwfFormat.ROOT_FLAG_HAS_BASE != 0
 
@@ -62,6 +68,12 @@ data class RootDraft(
     val inline: ByteBuffer,
     /** Optional STATS protobuf; null omits the section. */
     val stats: ByteArray? = null,
+    /**
+     * Packed inline (SPEC 3.8): compress the whole INLINE body as one plain zstd stream at this level when that makes
+     * it smaller. The caller decides when a root is packed and makes its inline frames RAW. Null leaves the choice to
+     * the codec's own options (off by default).
+     */
+    val packInlineLevel: Int? = null,
 )
 
 /** Root reader and writer. Pure: no IO, no shared state. */

@@ -507,6 +507,9 @@ class NwfV1RootView internal constructor(
 ) : RootView {
     override val inlineLength: Long get() = inline.capacity().toLong()
 
+    override val isInlinePacked: Boolean
+        get() = toc.any { it.type == SectionType.INLINE.id && it.flags and NwfFormat.TOC_FLAG_ZSTD != 0 }
+
     /** The STATS protobuf, or null when the root has none. */
     fun stats(): ByteArray? = stats?.copyOf()
 
@@ -678,8 +681,13 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
     private fun raw(type: SectionType, body: ByteArray) = Section(type, 0, body, body.size)
 
     private fun inlineSection(inline: ByteArray): Section {
-        if (options.packInlineMaxRawBytes > 0 && inline.size <= options.packInlineMaxRawBytes) {
-            val packed = ZstdSupport.compress(inline, options.packInlineLevel)
+        val level = draft.packInlineLevel
+            ?: options.packInlineLevel.takeIf {
+                options.packInlineMaxRawBytes > 0 && inline.size <= options.packInlineMaxRawBytes
+            }
+        if (level != null) {
+            if (level !in ZstdSupport.levels) nwfError(NwfFormatError.OUT_OF_BOUNDS, "packInlineLevel $level")
+            val packed = ZstdSupport.compress(inline, level)
             if (packed.size < inline.size) {
                 return Section(SectionType.INLINE, NwfFormat.TOC_FLAG_ZSTD, packed, inline.size)
             }

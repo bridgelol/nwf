@@ -45,10 +45,19 @@ data class WorldBuildOptions(
      * placed INLINE or segment bytes are assembled next to the held frames.
      */
     val maxHeldBytes: Long = DEFAULT_MAX_HELD_BYTES,
+    /**
+     * Packed inline (SPEC 3.8): when the world's frames decode to at most this many bytes in all and fit inline, every
+     * frame is stored RAW and INLINE is one zstd stream at [packInlineLevel]. 0 (the default) never packs.
+     */
+    val packInlineMaxRawBytes: Long = 0,
+    val packInlineLevel: Int = DEFAULT_PACK_INLINE_LEVEL,
 ) {
     companion object {
         /** 256 MiB of compressed frames: well above any world a single root and its segments are meant for. */
         const val DEFAULT_MAX_HELD_BYTES: Long = 256L * 1024 * 1024
+
+        /** Default zstd level of a packed INLINE stream (SPEC.md 3.8). */
+        const val DEFAULT_PACK_INLINE_LEVEL: Int = 3
     }
 }
 

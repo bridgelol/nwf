@@ -118,6 +118,28 @@ class NwfV1WorldBuilderAndFsckTest {
     }
 
     @Test
+    fun `a world under the pack bound is built packed inline, RAW frames in one stream, same content, fsck clean`() {
+        val options = buildOptions(inlineBudget = 16L * 1024 * 1024, dicts = true).copy(packInlineMaxRawBytes = 1L shl 20)
+        val world = build(options)
+        assertEquals(3, world.root.packInlineLevel)
+        assertTrue(world.root.entries.all { it.isInline && it.codec == FrameCodec.RAW && it.dictSlot == NwfFormat.NONE_U16 })
+        assertEquals(1, world.root.dictionaries.size, "DICTS stay as the conversion wrote them")
+        val bytes = rootCodec.write(world.root)
+        assertTrue(rootCodec.parse(ByteBuffer.wrap(bytes)).isInlinePacked)
+        val back = readBack(world)
+        nbt.forEach { (key, data) -> assertArrayEquals(expected(key, data), back.getValue(key), "$key") }
+        val report = fsck.check(ByteBuffer.wrap(bytes), fetcher(emptyList()), lookupOf(TestDictionaries.chunk))
+        assertTrue(report.clean, "${report.issues}")
+        assertEquals(nbt.size, report.framesDecoded)
+
+        // Over the bound: the per-frame layout, exactly as without packing.
+        val over = build(options.copy(packInlineMaxRawBytes = 16))
+        assertEquals(null, over.root.packInlineLevel)
+        assertTrue(over.root.entries.filter { it.kind == ChunkKind.CHUNK }.all { it.codec == FrameCodec.ZSTD_DICT })
+        assertTrue(!rootCodec.parse(ByteBuffer.wrap(rootCodec.write(over.root))).isInlinePacked)
+    }
+
+    @Test
     fun `the builder fails cleanly past its held-bytes cap and is spent`() {
         val builder = factory.create(buildOptions(16L * 1024 * 1024).copy(maxHeldBytes = 4096))
         builder.header(header())

@@ -8,6 +8,19 @@ import com.github.luben.zstd.ZstdDictDecompress
 import com.github.luben.zstd.ZstdException
 import gg.netherite.world.nwf.NwfFormat
 import gg.netherite.world.nwf.NwfFormatError
+import java.util.concurrent.atomic.LongAdder
+
+/**
+ * Process-wide count of zstd decompressions by the NWF codecs (frames and root sections alike). Diagnostics: tests use
+ * it to prove a packed root's INLINE is decompressed once per parse, never once per chunk read. A [LongAdder], so the
+ * region threads that decode chunks concurrently each add to their own cell and never contend on one word.
+ */
+object NwfZstdCounters {
+    internal val decompressions = LongAdder()
+
+    /** zstd decompressions since the process started. */
+    fun decompressions(): Long = decompressions.sum()
+}
 
 /**
  * Single-shot zstd with the NWF frame settings. Every frame carries its content size and the zstd content checksum, so
@@ -99,6 +112,7 @@ internal object ZstdSupport {
             nwfError(NwfFormatError.BAD_PAYLOAD, "$what: $rawLength bytes cannot come from ${src.size} stored bytes")
         }
         val out = ByteArray(rawLength)
+        NwfZstdCounters.decompressions.increment()
         val written = try {
             ctx.decompressByteArray(out, 0, rawLength, src, 0, src.size)
         } catch (e: ZstdException) {
