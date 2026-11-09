@@ -20,7 +20,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Root writer settings. [sectionLevel] compresses INDEX (always zstd, no dictionary). Packed inline (off by
+ * Root writer settings. [sectionLevel] compresses INDEX (always zstd, no dictionary), and HEADER and STATS when that
+ * makes them smaller and the draft names no level of its own ([RootDraft.headerLevel]). Packed inline (off by
  * default) compresses the whole INLINE body as one zstd stream at [packInlineLevel] when its raw length is at most
  * [packInlineMaxRawBytes] (0 = off) and packing makes it smaller; frames of a packed root are normally RAW.
  */
@@ -657,8 +658,9 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
     }
 
     private fun buildSections(inline: ByteArray): List<Section> = buildList {
-        val headerBytes = NwfV1RootCodec.encodeHeader(draft.header)
-        add(Section(SectionType.HEADER, 0, headerBytes, headerBytes.size))
+        val headerLevel = draft.headerLevel ?: options.sectionLevel
+        if (headerLevel !in ZstdSupport.levels) nwfError(NwfFormatError.OUT_OF_BOUNDS, "headerLevel $headerLevel")
+        add(smallerOf(SectionType.HEADER, 0, NwfV1RootCodec.encodeHeader(draft.header), headerLevel))
         if (draft.dictionaries.isNotEmpty()) {
             val w = LeWriter(RootLayout.LIST_PREFIX + draft.dictionaries.size * NwfFormat.DICT_ENTRY_BYTES)
             w.u16(draft.dictionaries.size)
@@ -675,10 +677,23 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
         val packedIndex = ZstdSupport.compress(index, options.sectionLevel)
         add(Section(SectionType.INDEX, NwfFormat.TOC_FLAG_ZSTD, packedIndex, index.size))
         if (inline.isNotEmpty()) add(inlineSection(inline))
-        draft.stats?.let { add(Section(SectionType.STATS, NwfFormat.TOC_FLAG_OPTIONAL, it.copyOf(), it.size)) }
+        draft.stats?.let { add(smallerOf(SectionType.STATS, NwfFormat.TOC_FLAG_OPTIONAL, it.copyOf(), headerLevel)) }
     }
 
     private fun raw(type: SectionType, body: ByteArray) = Section(type, 0, body, body.size)
+
+    /**
+     * [body] as one plain zstd stream at [level] (TOC flag ZSTD, no dictionary) when that is smaller, else as is. Every
+     * reader decodes a ZSTD body of any known section, and the section CRC covers the stored bytes either way.
+     */
+    private fun smallerOf(type: SectionType, flags: Int, body: ByteArray, level: Int): Section {
+        val packed = ZstdSupport.compress(body, level)
+        return if (packed.size < body.size) {
+            Section(type, flags or NwfFormat.TOC_FLAG_ZSTD, packed, body.size)
+        } else {
+            Section(type, flags, body, body.size)
+        }
+    }
 
     private fun inlineSection(inline: ByteArray): Section {
         val level = draft.packInlineLevel

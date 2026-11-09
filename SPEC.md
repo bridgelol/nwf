@@ -86,8 +86,9 @@ The flags and `dictSlot` rules apply to known section types only. A reader MUST 
 has OPTIONAL set without checking its other flag bits, its `dictSlot` or its `rawLength` (a later minor may define
 them; its CRC32C and the TOC layout rules above still apply), and MUST reject a section of unknown type without OPTIONAL.
 
-Any known section MAY be zstd-compressed. The reference writer compresses INDEX always and INLINE only when packed
-(3.8), and writes the others uncompressed.
+Any known section MAY be zstd-compressed. The reference writer compresses INDEX always, HEADER and STATS when smaller,
+and INLINE only when packed (3.8), and writes the others uncompressed. Its HEADER and STATS streams are plain zstd
+(no dictionary); a reader decodes them like any other ZSTD body.
 
 ### 3.3 Section types
 

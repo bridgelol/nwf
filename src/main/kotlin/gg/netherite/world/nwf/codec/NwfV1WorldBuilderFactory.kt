@@ -165,6 +165,7 @@ class NwfV1WorldBuilderFactory(
                 entries = entries,
                 inline = ByteBuffer.wrap(placed.inline),
                 packInlineLevel = options.packInlineLevel.takeIf { packed },
+                headerLevel = options.saveLevel,
             )
             rootCodec.write(draft) // fails closed on any limit or reference breach before the caller PUTs anything
             return BuiltWorld(draft, placed.segments)

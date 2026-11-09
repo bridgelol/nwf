@@ -56,7 +56,8 @@ interface RootView {
 
 /**
  * The input to [NwfRootCodec.write]. [entries] must be strictly sorted by [ChunkKey]; inline entries' offsets point
- * into [inline]. The writer computes `headerCrc`, section CRCs, the TOC and compresses INDEX.
+ * into [inline]. The writer computes `headerCrc`, section CRCs, the TOC, compresses INDEX, and compresses HEADER and
+ * STATS when that makes them smaller.
  */
 data class RootDraft(
     val flags: Int,
@@ -74,6 +75,12 @@ data class RootDraft(
      * the codec's own options (off by default).
      */
     val packInlineLevel: Int? = null,
+    /**
+     * The zstd level for HEADER and STATS (SPEC 3.2): each is stored as one plain zstd stream (no dictionary) when that
+     * makes it smaller, else uncompressed. Writers that know the world's save level pass it; null uses the codec's
+     * own section level.
+     */
+    val headerLevel: Int? = null,
 )
 
 /** Root reader and writer. Pure: no IO, no shared state. */
