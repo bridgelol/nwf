@@ -40,13 +40,40 @@ object LightStripNbtFilter : NbtStreamFilter {
         light: LightPolicy,
         heightmaps: HeightmapPolicy,
     ): FilteredNbt =
-        scan(kind, nbt.copyRemaining(), light, heightmaps).filtered
+        scan(kind, nbt, light, heightmaps, copyIfUnmodified = true).filtered
 
     /** As [filter] on an array the caller hands over, plus the coordinates the NBT carries. */
     internal fun scan(kind: ChunkKind, nbt: ByteArray, light: LightPolicy, heightmaps: HeightmapPolicy): NbtScan {
         val stripLight = kind == ChunkKind.CHUNK && light == LightPolicy.STRIP
         val stripHeightmaps = kind == ChunkKind.CHUNK && heightmaps == HeightmapPolicy.STRIP
-        return NbtWalker(nbt, kind, stripLight, stripHeightmaps).run()
+        return NbtWalker(nbt, 0, nbt.size, kind, stripLight, stripHeightmaps).run(copyIfBorrowedAndUnmodified = false)
+    }
+
+    /** Scans [nbt] without copying array-backed buffers when [copyIfUnmodified] is false. */
+    internal fun scan(
+        kind: ChunkKind,
+        nbt: ByteBuffer,
+        light: LightPolicy,
+        heightmaps: HeightmapPolicy,
+        copyIfUnmodified: Boolean,
+    ): NbtScan {
+        val stripLight = kind == ChunkKind.CHUNK && light == LightPolicy.STRIP
+        val stripHeightmaps = kind == ChunkKind.CHUNK && heightmaps == HeightmapPolicy.STRIP
+        val borrowed = nbt.hasArray()
+        val array: ByteArray
+        val start: Int
+        val end: Int
+        if (borrowed) {
+            array = nbt.array()
+            start = nbt.arrayOffset() + nbt.position()
+            end = start + nbt.remaining()
+        } else {
+            array = nbt.copyRemaining()
+            start = 0
+            end = array.size
+        }
+        return NbtWalker(array, start, end, kind, stripLight, stripHeightmaps)
+            .run(copyIfBorrowedAndUnmodified = copyIfUnmodified && borrowed, borrowed = borrowed)
     }
 }
 
@@ -60,6 +87,7 @@ internal class NbtScan(
     val z: Int?,
     val legacyLayout: Boolean,
     val mixedPositions: Boolean = false,
+    val ownsBytes: Boolean = true,
 )
 
 private object NbtTags {
@@ -104,14 +132,16 @@ private object NbtTags {
 
 private class NbtWalker(
     private val b: ByteArray,
+    private val start: Int,
+    private val end: Int,
     private val kind: ChunkKind,
     private val stripLight: Boolean,
     private val stripHeightmaps: Boolean,
 ) {
-    private var pos = 0
+    private var pos = start
 
     /** Bytes before [copyFrom] are already in [out]; a drop copies up to the dropped tag and skips it. */
-    private var copyFrom = 0
+    private var copyFrom = start
     private var out: LeWriter? = null
 
     private var dataVersion = 0
@@ -120,23 +150,45 @@ private class NbtWalker(
     private var legacy = false
     private var mixed = false
 
-    fun run(): NbtScan {
+    fun run(copyIfBorrowedAndUnmodified: Boolean, borrowed: Boolean = false): NbtScan {
         val rootType = u8()
         if (rootType != NbtTags.COMPOUND) bad("root tag type $rootType, expected a compound")
         skip(u16())
         walkRoot()
-        if (pos != b.size) bad("${b.size - pos} trailing bytes after the root compound")
+        if (pos != end) bad("${end - pos} trailing bytes after the root compound")
         // A pre-1.18 chunk (root `Level`) passes through byte-identical, whatever tags were dropped before `Level`
         // was seen: the server's data fixer owns it.
-        if (legacy) return NbtScan(FilteredNbt(ByteBuffer.wrap(b), dataVersion, 0), x, z, legacy, mixed)
-        val bytes = out?.let {
-            it.bytes(b, copyFrom, b.size - copyFrom)
-            it.toByteArray()
-        } ?: b
+        if (legacy) {
+            val slice = if (copyIfBorrowedAndUnmodified) {
+                val copy = b.copyOfRange(start, end)
+                ByteSlice(copy, 0, copy.size)
+            } else {
+                ByteSlice(b, start, end - start)
+            }
+            val owns = !borrowed || copyIfBorrowedAndUnmodified
+            return NbtScan(FilteredNbt(slice, dataVersion, 0, x, z), x, z, legacy, mixed, ownsBytes = owns)
+        }
+        val written = out?.let {
+            it.bytes(b, copyFrom, end - copyFrom)
+            it.takeByteArray()
+        }
+        val slice: ByteSlice
+        val owns: Boolean
+        if (written != null) {
+            slice = ByteSlice(written, 0, written.size)
+            owns = true
+        } else if (copyIfBorrowedAndUnmodified) {
+            val copy = b.copyOfRange(start, end)
+            slice = ByteSlice(copy, 0, copy.size)
+            owns = true
+        } else {
+            slice = ByteSlice(b, start, end - start)
+            owns = !borrowed
+        }
         var flags = 0
         if (stripLight && !legacy) flags = flags or EntryFlags.LIGHT_STRIPPED
         if (stripHeightmaps && !legacy) flags = flags or EntryFlags.HEIGHTMAPS_STRIPPED
-        return NbtScan(FilteredNbt(ByteBuffer.wrap(bytes), dataVersion, flags), x, z, legacy, mixed)
+        return NbtScan(FilteredNbt(slice, dataVersion, flags, x, z), x, z, legacy, mixed, ownsBytes = owns)
     }
 
     private fun walkRoot() {
@@ -337,7 +389,7 @@ private class NbtWalker(
     }
 
     private fun drop(tagStart: Int) {
-        val sink = out ?: LeWriter(b.size).also { out = it }
+        val sink = out ?: LeWriter(end - start).also { out = it }
         sink.bytes(b, copyFrom, tagStart - copyFrom)
         copyFrom = pos
     }
@@ -355,7 +407,7 @@ private class NbtWalker(
     }
 
     private fun need(n: Long) {
-        if (n < 0 || n > b.size - pos) bad("truncated NBT at $pos (needs $n more bytes)")
+        if (n < 0 || n > end - pos) bad("truncated NBT at ${pos - start} (needs $n more bytes)")
     }
 
     private fun skip(n: Int) = skip(n.toLong())

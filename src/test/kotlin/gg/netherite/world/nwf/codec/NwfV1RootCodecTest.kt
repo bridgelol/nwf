@@ -436,4 +436,77 @@ class NwfV1RootCodecTest {
         assertFormatError(NwfFormatError.OUT_OF_BOUNDS) { codec.write(good.copy(inline = ByteBuffer.allocate(4))) }
         assertFormatError(NwfFormatError.DANGLING_REFERENCE) { codec.write(good.copy(header = header(emptyList()))) }
     }
+
+    @Test
+    fun `writeWithView matches parse(write) across unpacked, packed inline, segments, dicts, and unsorted unknown fields`() {
+        val segSha = Sha256(ByteArray(32) { (it + 1).toByte() })
+        val segEntry = IndexEntry(4, 4, 1, ChunkKind.CHUNK, FrameCodec.ZSTD_DICT, 0, 0, 0, 32, 100, 300, 123, 77)
+        val deltaEntry = IndexEntry(
+            5, 4, 1, ChunkKind.CHUNK, FrameCodec.ZSTD_BASE_DELTA, EntryFlags.BASE_DELTA or EntryFlags.LIGHT_STRIPPED,
+            0, NwfFormat.NONE_U16, 160, 20, 300, 9, 77,
+        )
+        val unsortedUnknown = listOf(
+            gg.netherite.world.nwf.HeaderField(40, gg.netherite.world.nwf.HeaderField.LEN, byteArrayOf(1, 2, 3)),
+            gg.netherite.world.nwf.HeaderField(10, gg.netherite.world.nwf.HeaderField.VARINT, byteArrayOf(1)),
+        )
+        val h = WorldHeader(
+            dimensions = listOf("minecraft:overworld", "minecraft:the_nether"),
+            baseRootSha = ByteArray(32) { 1 },
+            baseKey = "templates/example",
+            contentClass = "example",
+            parentRootSha = ByteArray(32) { 2 },
+            unknownFields = unsortedUnknown,
+        )
+        val inlineDraft = inlineDraft()
+        val segmentedDraft = RootDraft(
+            flags = NwfFormat.ROOT_FLAG_HAS_BASE,
+            generation = 42,
+            header = h,
+            dictionaries = listOf(DictRef(11, Sha256(ByteArray(32) { 3 }))),
+            segments = listOf(SegmentRef(segSha, 7, 4096, 2)),
+            entries = listOf(tombstone(ChunkKey(0, ChunkKind.CHUNK, 0, 0)), segEntry, deltaEntry),
+            inline = ByteBuffer.allocate(0),
+            stats = byteArrayOf(8, 1),
+        )
+        val packedFrames = sampleNbt().mapValues { (key, nbt) ->
+            pipeline.encode(key, ByteBuffer.wrap(nbt), options().copy(raw = true))
+        }
+        val packedDraft = inlineDraft(packedFrames).copy(packInlineLevel = 3)
+
+        for (draft in listOf(inlineDraft, segmentedDraft, packedDraft)) {
+            val expectedBytes = codec.write(draft)
+            val before = NwfZstdCounters.decompressions()
+            val written = codec.writeWithView(draft)
+            assertEquals(before, NwfZstdCounters.decompressions(), "writeWithView must never decompress INDEX or INLINE")
+            assertArrayEquals(expectedBytes, written.bytes)
+
+            val parsed = codec.parse(ByteBuffer.wrap(expectedBytes))
+            val view = written.view as NwfV1RootView
+            assertEquals(parsed.minor, view.minor)
+            assertEquals(parsed.flags, view.flags)
+            assertEquals(parsed.generation, view.generation)
+            assertEquals(parsed.header, view.header)
+            assertEquals(parsed.dictionaries, view.dictionaries)
+            assertEquals(parsed.segments, view.segments)
+            assertEquals(parsed.entryCount, view.entryCount)
+            assertEquals(parsed.rootSha, view.rootSha)
+            assertEquals(parsed.storedLength, view.storedLength)
+            assertEquals(parsed.inlineLength, view.inlineLength)
+            assertEquals(parsed.isInlinePacked, view.isInlinePacked)
+            assertEquals(parsed.toc, view.toc)
+            assertArrayEquals(parsed.stats(), view.stats())
+            assertEquals(parsed.entries().toList(), view.entries().toList())
+            for (entry in parsed.entries()) {
+                assertEquals(entry, view.find(entry.key))
+                assertFalse(view.hasNoEntries(entry.dim, entry.x, entry.z))
+                if (entry.isInline && !entry.isTombstone) {
+                    assertArrayEquals(parsed.inlinePayload(entry).toBytes(), view.inlinePayload(entry).toBytes())
+                }
+            }
+            assertTrue(view.hasNoEntries(0, 9999, 9999))
+        }
+
+        val badUuidDraft = inlineDraft.copy(header = header().copy(worldUuidBytes = byteArrayOf(1, 2, 3)))
+        assertFormatError(NwfFormatError.INVALID_HEADER) { codec.writeWithView(badUuidDraft) }
+    }
 }

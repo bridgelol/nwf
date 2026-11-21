@@ -61,8 +61,53 @@ data class WorldBuildOptions(
     }
 }
 
-/** A complete new world: root draft plus the segments it references, which must be stored before the root. */
-data class BuiltWorld(val root: RootDraft, val segments: List<WrittenSegment>)
+/**
+ * A complete new world: root draft plus the segments it references, which must be stored before the root.
+ * When produced by a builder that already serialized [root], [rootBytes] / [rootBytesView] expose those bytes so
+ * callers do not need to serialize [root] a second time.
+ */
+class BuiltWorld private constructor(
+    val root: RootDraft,
+    val segments: List<WrittenSegment>,
+    private val serializedRoot: ByteArray?,
+    @Suppress("UNUSED_PARAMETER") owned: Boolean,
+) {
+    constructor(root: RootDraft, segments: List<WrittenSegment>) : this(root, segments, null, owned = true)
+
+    constructor(root: RootDraft, segments: List<WrittenSegment>, rootBytes: ByteArray?) : this(
+        root = root,
+        segments = segments,
+        serializedRoot = rootBytes?.copyOf(),
+        owned = true,
+    )
+
+    /** A copy of the already-serialized root bytes, or null when not pre-serialized. */
+    fun rootBytes(): ByteArray? = serializedRoot?.copyOf()
+
+    /** A read-only view of the already-serialized root bytes without copying, or null when not pre-serialized. */
+    fun rootBytesView(): ByteBuffer? = serializedRoot?.let { ByteBuffer.wrap(it).asReadOnlyBuffer() }
+
+    operator fun component1(): RootDraft = root
+
+    operator fun component2(): List<WrittenSegment> = segments
+
+    fun copy(
+        root: RootDraft = this.root,
+        segments: List<WrittenSegment> = this.segments,
+    ): BuiltWorld = BuiltWorld(root, segments, if (root == this.root) serializedRoot else null, owned = true)
+
+    override fun equals(other: Any?): Boolean =
+        this === other || (other is BuiltWorld && root == other.root && segments == other.segments)
+
+    override fun hashCode(): Int = 31 * root.hashCode() + segments.hashCode()
+
+    override fun toString(): String = "BuiltWorld(root=$root, segments=$segments)"
+
+    internal companion object {
+        fun withOwnedRootBytes(root: RootDraft, segments: List<WrittenSegment>, rootBytes: ByteArray): BuiltWorld =
+            BuiltWorld(root, segments, rootBytes, owned = true)
+    }
+}
 
 /**
  * Builds a generation-1 NWF world from a converter's output. Single use: [finish] once, then discard. Frames are

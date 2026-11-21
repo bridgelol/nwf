@@ -23,6 +23,10 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.api.assertThrows
 import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ZstdFramePipelineTest {
@@ -200,4 +204,192 @@ class ZstdFramePipelineTest {
             encode(key, nbt, options(dictionary = TestDictionaries.chunk, slot = 0).copy(raw = true))
         }
     }
+
+    @Test
+    fun `base delta refuses base content starting with zstd dictionary magic`() {
+        val key = ChunkKey(0, ChunkKind.CHUNK, 2, 2)
+        val nbt = nbtBytes(TestChunks.chunk(2, 2, PaletteStyle.FULL, 5))
+        val dictMagicBase = byteArrayOf(0x37, 0xA4.toByte(), 0x30, 0xEC.toByte(), 1, 2, 3, 4)
+
+        assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+            encode(key, nbt, options().copy(baseNbt = ByteBuffer.wrap(dictMagicBase)))
+        }
+        assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+            ZstdSupport.compressWithRawContent(nbt, 3, dictMagicBase)
+        }
+
+        val validBase =
+            expected(key, nbtBytes(TestChunks.chunk(2, 2, PaletteStyle.FULL, 5, lastUpdate = 1)), LightPolicy.STRIP)
+        val delta = encode(key, nbt, options().copy(baseNbt = ByteBuffer.wrap(validBase)))
+        assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+            pipeline.decode(delta, NO_DICTS, ByteBuffer.wrap(dictMagicBase))
+        }
+    }
+
+    @Test
+    fun `encodeFiltered matches encode byte for byte across policies, codecs, and buffer forms`() {
+        val dict = TestDictionaries.chunk
+        val baseKey = ChunkKey(0, ChunkKind.CHUNK, 0, 0)
+        val baseNbt =
+            expected(baseKey, nbtBytes(TestChunks.chunk(0, 0, PaletteStyle.FULL, 1, lastUpdate = 1)), LightPolicy.STRIP)
+        val legacyChunk = nbtBytes(
+            compound(
+                "DataVersion" to TInt(1343),
+                "sections" to compoundList(listOf(compound("Y" to TByte(0), "BlockLight" to TByteArray(ByteArray(2048))))),
+                "isLightOn" to TByte(1),
+                "Level" to compound("xPos" to TInt(1), "zPos" to TInt(2)),
+            ),
+        )
+        val cases = sampleNbt() + (ChunkKey(0, ChunkKind.CHUNK, 1, 2) to legacyChunk)
+        for ((key, nbt) in cases) {
+            for (light in LightPolicy.entries) {
+                for (heightmaps in HeightmapPolicy.entries) {
+                    val baseForKey = baseNbt.takeIf { key == baseKey && light == LightPolicy.STRIP && heightmaps == HeightmapPolicy.KEEP }
+                    assertEncodeFilteredMatches(key, nbt, light, heightmaps, dict, baseForKey)
+                }
+            }
+        }
+
+        // Coordinate mismatch and invalid flags are still refused on encodeFiltered.
+        val chunkAt5 = LightStripNbtFilter.filter(ChunkKind.CHUNK, ByteBuffer.wrap(nbtBytes(TestChunks.chunk(5, 5, PaletteStyle.EMPTY, 1))), LightPolicy.STRIP, HeightmapPolicy.KEEP)
+        assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+            pipeline.encodeFiltered(ChunkKey(0, ChunkKind.CHUNK, 5, 6), chunkAt5, options())
+        }
+        val badFlags = gg.netherite.world.nwf.FilteredNbt(chunkAt5.nbtView(), chunkAt5.dataVersion, EntryFlags.TOMBSTONE)
+        assertFormatError(NwfFormatError.UNKNOWN_FLAGS) {
+            pipeline.encodeFiltered(ChunkKey(0, ChunkKind.CHUNK, 5, 5), badFlags, options())
+        }
+    }
+
+    @Suppress("LongParameterList")
+    private fun assertEncodeFilteredMatches(
+        key: ChunkKey,
+        nbt: ByteArray,
+        light: LightPolicy,
+        heightmaps: HeightmapPolicy,
+        dict: NwfDictionary,
+        baseNbt: ByteArray?,
+    ) {
+        val optsList = buildList {
+            add(FrameEncodeOptions(3, light, heightmaps))
+            add(FrameEncodeOptions(3, light, heightmaps, dictionary = dict, dictSlot = 0))
+            add(FrameEncodeOptions(3, light, heightmaps, raw = true))
+            if (baseNbt != null) add(FrameEncodeOptions(3, light, heightmaps, baseNbt = ByteBuffer.wrap(baseNbt)))
+        }
+        for (opts in optsList) {
+            val padded = byteArrayOf(9, 8, 7) + nbt + byteArrayOf(6, 5)
+            val sliced = ByteBuffer.wrap(padded, 3, nbt.size).slice()
+            val direct = pipeline.encode(key, sliced, opts)
+            val filtered = LightStripNbtFilter.filter(key.kind, ByteBuffer.wrap(nbt).asReadOnlyBuffer(), light, heightmaps)
+            val preFiltered = pipeline.encodeFiltered(key, filtered, opts)
+            assertEquals(direct.header, preFiltered.header, "$key $light $heightmaps $opts")
+            assertEquals(direct.dataVersion, preFiltered.dataVersion)
+            assertArrayEquals(direct.payloadView().toBytes(), preFiltered.payloadView().toBytes())
+        }
+    }
+
+    @Test
+    fun `concurrent ZstdSupport context reuse never leaks dictionaries, raw prefixes, parameters, or errors`() {
+        val dict = TestDictionaries.chunk
+        val dictCompress = com.github.luben.zstd.ZstdDictCompress(dict.bytes(), 3)
+        val dictDecompress = com.github.luben.zstd.ZstdDictDecompress(dict.bytes())
+        val wrongDictDecompress = com.github.luben.zstd.ZstdDictDecompress(TestDictionaries.other.bytes())
+        try {
+            val plainSrc = nbtBytes(TestChunks.chunk(0, 0, PaletteStyle.FULL, 11))
+            val dictSrc = nbtBytes(TestChunks.chunk(1, 2, PaletteStyle.FULL, 22))
+            val rawBase = nbtBytes(TestChunks.chunk(3, 4, PaletteStyle.FULL, 33, lastUpdate = 1))
+            val deltaSrc = nbtBytes(TestChunks.chunk(3, 4, PaletteStyle.FULL, 33, lastUpdate = 99))
+            val inputs = ConcurrentReuseInputs(
+                plainSrc = plainSrc,
+                dictSrc = dictSrc,
+                rawBase = rawBase,
+                deltaSrc = deltaSrc,
+                plainExpected = ZstdSupport.compress(plainSrc, 3),
+                highLevelExpected = ZstdSupport.compress(plainSrc, 9),
+                dictExpected = ZstdSupport.compress(dictSrc, 3, dictCompress),
+                deltaExpected = ZstdSupport.compressWithRawContent(deltaSrc, 3, rawBase),
+                dictCompress = dictCompress,
+                dictDecompress = dictDecompress,
+                wrongDictDecompress = wrongDictDecompress,
+            )
+
+            val threads = 8
+            val pool = Executors.newFixedThreadPool(threads)
+            val gate = CountDownLatch(1)
+            try {
+                val futures: List<Future<*>> = (0 until threads).map { t ->
+                    pool.submit {
+                        gate.await()
+                        repeat(80) { i -> runConcurrentReuseStep((t + i) % 5, inputs) }
+                    }
+                }
+                gate.countDown()
+                futures.forEach { it.get(30, TimeUnit.SECONDS) }
+            } finally {
+                pool.shutdownNow()
+            }
+        } finally {
+            // Proves ThreadLocal contexts released all shared locks on ZstdDictCompress / ZstdDictDecompress.
+            dictCompress.close()
+            dictDecompress.close()
+            wrongDictDecompress.close()
+        }
+    }
+
+    private fun runConcurrentReuseStep(mode: Int, inputs: ConcurrentReuseInputs) {
+        when (mode) {
+            0 -> {
+                val c = ZstdSupport.compress(inputs.plainSrc, 3)
+                assertArrayEquals(inputs.plainExpected, c)
+                assertArrayEquals(inputs.plainSrc, ZstdSupport.decompress(c, inputs.plainSrc.size, "plain"))
+            }
+            1 -> {
+                val c = ZstdSupport.compress(inputs.dictSrc, 3, inputs.dictCompress)
+                assertArrayEquals(inputs.dictExpected, c)
+                assertArrayEquals(inputs.dictSrc, ZstdSupport.decompress(c, inputs.dictSrc.size, inputs.dictDecompress, "dict"))
+            }
+            2 -> {
+                val c = ZstdSupport.compressWithRawContent(inputs.deltaSrc, 3, inputs.rawBase)
+                assertArrayEquals(inputs.deltaExpected, c)
+                assertArrayEquals(inputs.deltaSrc, ZstdSupport.decompressWithRawContent(c, inputs.deltaSrc.size, inputs.rawBase, "delta"))
+            }
+            3 -> {
+                val c = ZstdSupport.compress(inputs.plainSrc, 9)
+                assertArrayEquals(inputs.highLevelExpected, c)
+                assertArrayEquals(inputs.plainSrc, ZstdSupport.decompress(c, inputs.plainSrc.size, "high"))
+            }
+            else -> {
+                assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+                    ZstdSupport.decompress(inputs.dictExpected, inputs.dictSrc.size, "plain-on-dict")
+                }
+                assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+                    ZstdSupport.decompress(inputs.dictExpected, inputs.dictSrc.size, inputs.wrongDictDecompress, "wrong-dict")
+                }
+                assertArrayEquals(
+                    inputs.plainSrc,
+                    ZstdSupport.decompress(inputs.plainExpected, inputs.plainSrc.size, inputs.dictDecompress, "dict-on-plain"),
+                )
+                assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+                    ZstdSupport.decompress(byteArrayOf(0x28, 0xB5.toByte(), 0x2F), 10, "truncated")
+                }
+                assertFormatError(NwfFormatError.BAD_PAYLOAD) {
+                    ZstdSupport.compressWithRawContent(inputs.deltaSrc, 3, byteArrayOf(0x37, 0xA4.toByte(), 0x30, 0xEC.toByte(), 1))
+                }
+            }
+        }
+    }
+
+    private class ConcurrentReuseInputs(
+        val plainSrc: ByteArray,
+        val dictSrc: ByteArray,
+        val rawBase: ByteArray,
+        val deltaSrc: ByteArray,
+        val plainExpected: ByteArray,
+        val highLevelExpected: ByteArray,
+        val dictExpected: ByteArray,
+        val deltaExpected: ByteArray,
+        val dictCompress: com.github.luben.zstd.ZstdDictCompress,
+        val dictDecompress: com.github.luben.zstd.ZstdDictDecompress,
+        val wrongDictDecompress: com.github.luben.zstd.ZstdDictDecompress,
+    )
 }

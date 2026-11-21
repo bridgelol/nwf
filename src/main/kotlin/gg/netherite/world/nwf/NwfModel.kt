@@ -1,5 +1,7 @@
 package gg.netherite.world.nwf
 
+import gg.netherite.world.nwf.codec.ByteSlice
+import gg.netherite.world.nwf.codec.arraySliceOrNull
 import java.nio.ByteBuffer
 import java.util.HexFormat
 
@@ -215,6 +217,7 @@ data class FrameHeader(
  * payload. Immutable: [payload] is read-only and nobody may change its content; readers take [payloadView].
  */
 class EncodedFrame(val header: FrameHeader, val dataVersion: Int, payload: ByteBuffer) {
+    internal val backing: ByteSlice? = payload.arraySliceOrNull()
     private val bytes: ByteBuffer = payload.asReadOnlyBuffer()
 
     init {

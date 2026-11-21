@@ -1,5 +1,7 @@
 package gg.netherite.world.nwf
 
+import gg.netherite.world.nwf.codec.ByteSlice
+import gg.netherite.world.nwf.codec.arraySliceOrNull
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 
@@ -59,13 +61,63 @@ data class FrameEncodeOptions(
 interface FramePipeline {
     fun encode(key: ChunkKey, nbt: ByteBuffer, options: FrameEncodeOptions): EncodedFrame
 
+    /**
+     * Encodes an NBT payload already filtered by [NbtStreamFilter.filter] under [options]'s policies, avoiding a
+     * second scan over the NBT stream when the implementation supports it.
+     */
+    fun encodeFiltered(key: ChunkKey, filtered: FilteredNbt, options: FrameEncodeOptions): EncodedFrame =
+        encode(key, filtered.nbtView(), options)
+
     /** [baseNbt] is the base snapshot's decoded frame for the same key; required for ZSTD_BASE_DELTA frames. */
     fun decode(frame: EncodedFrame, dictionaries: DictionaryLookup, baseNbt: ByteBuffer?): ByteBuffer
 }
 
-/** What [NbtStreamFilter.filter] produced: the NBT to compress, its `DataVersion` and the entry flags to set. */
-class FilteredNbt(nbt: ByteBuffer, val dataVersion: Int, val entryFlags: Int) {
+/**
+ * What [NbtStreamFilter.filter] produced: the NBT to compress, its `DataVersion`, the entry flags to set, and the
+ * chunk coordinates carried by the NBT when present.
+ */
+class FilteredNbt private constructor(
+    nbt: ByteBuffer,
+    val dataVersion: Int,
+    val entryFlags: Int,
+    val x: Int?,
+    val z: Int?,
+    internal val backing: ByteSlice?,
+) {
     private val bytes: ByteBuffer = nbt.asReadOnlyBuffer()
+
+    constructor(nbt: ByteBuffer, dataVersion: Int, entryFlags: Int) : this(
+        nbt = nbt,
+        dataVersion = dataVersion,
+        entryFlags = entryFlags,
+        x = null,
+        z = null,
+        backing = nbt.arraySliceOrNull(),
+    )
+
+    constructor(nbt: ByteBuffer, dataVersion: Int, entryFlags: Int, x: Int?, z: Int?) : this(
+        nbt = nbt,
+        dataVersion = dataVersion,
+        entryFlags = entryFlags,
+        x = x,
+        z = z,
+        backing = nbt.arraySliceOrNull(),
+    )
+
+    internal constructor(
+        backing: ByteSlice,
+        dataVersion: Int,
+        entryFlags: Int,
+        x: Int?,
+        z: Int?,
+    ) : this(
+        nbt = ByteBuffer.wrap(backing.array, backing.offset, backing.length).slice(),
+        dataVersion = dataVersion,
+        entryFlags = entryFlags,
+        x = x,
+        z = z,
+        backing = backing,
+    )
 
     fun nbtView(): ByteBuffer = bytes.duplicate()
 }

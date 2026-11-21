@@ -23,7 +23,6 @@ import gg.netherite.world.nwf.convert.BuiltWorld
 import gg.netherite.world.nwf.convert.NwfWorldBuilder
 import gg.netherite.world.nwf.convert.NwfWorldBuilderFactory
 import gg.netherite.world.nwf.convert.WorldBuildOptions
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.TreeMap
 
@@ -167,8 +166,8 @@ class NwfV1WorldBuilderFactory(
                 packInlineLevel = options.packInlineLevel.takeIf { packed },
                 headerLevel = options.saveLevel,
             )
-            rootCodec.write(draft) // fails closed on any limit or reference breach before the caller PUTs anything
-            return BuiltWorld(draft, placed.segments)
+            val rootBytes = rootCodec.write(draft) // fails closed on any limit or reference breach before PUTs
+            return BuiltWorld.withOwnedRootBytes(draft, placed.segments, rootBytes)
         }
 
         /**
@@ -181,7 +180,7 @@ class NwfV1WorldBuilderFactory(
             val lookup = DictionaryLookup { slot -> bySlot[slot] }
             return frames.values.map { frame ->
                 if (frame.header.codec == FrameCodec.RAW) return@map frame
-                val raw = pipeline.decode(frame, lookup, null).copyRemaining()
+                val raw = pipeline.decode(frame, lookup, null).toExactByteArrayOrCopy()
                 val h = frame.header
                 EncodedFrame(
                     h.copy(
@@ -198,13 +197,25 @@ class NwfV1WorldBuilderFactory(
         }
 
         private fun placeInline(placedFrames: Collection<EncodedFrame>): Placement {
-            val inline = ByteArrayOutputStream()
-            val entries = placedFrames.map { frame ->
-                val offset = inline.size()
-                inline.write(frame.payloadView().copyRemaining())
-                entryOf(frame, NwfFormat.NONE_U16, offset)
+            val totalLong = placedFrames.sumOf { it.header.storedLength.toLong() }
+            if (totalLong > NwfFormat.MAX_FRAME_RAW_BYTES) {
+                nwfError(NwfFormatError.LIMIT_EXCEEDED, "inline body of $totalLong bytes")
             }
-            return Placement(entries, emptyList(), inline.toByteArray())
+            val inline = ByteArray(totalLong.toInt())
+            var offset = 0
+            val entries = placedFrames.map { frame ->
+                val len = frame.header.storedLength
+                val slice = frame.backing
+                if (slice != null) {
+                    System.arraycopy(slice.array, slice.offset, inline, offset, len)
+                } else {
+                    frame.payloadView().get(inline, offset, len)
+                }
+                val entry = entryOf(frame, NwfFormat.NONE_U16, offset)
+                offset += len
+                entry
+            }
+            return Placement(entries, emptyList(), inline)
         }
 
         private fun placeSegmented(): Placement {

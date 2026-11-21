@@ -25,8 +25,9 @@ object ZstdCapability {
     private val REQUIRED_CLASSES = listOf("ZstdException")
 
     private val REQUIRED_MEMBERS: List<Member> = listOf(
-        Member.static("Zstd", "getFrameContentSize", "long", "byte[]"),
-        Member.static("Zstd", "findFrameCompressedSize", "long", "byte[]"),
+        Member.static("Zstd", "getFrameContentSize", "long", "byte[]", "int", "int"),
+        Member.static("Zstd", "findFrameCompressedSize", "long", "byte[]", "int", "int"),
+        Member.static("Zstd", "compressBound", "long", "long"),
         Member.static("Zstd", "isError", "boolean", "long"),
         Member.static("Zstd", "getErrorName", "java.lang.String", "long"),
         Member.static("Zstd", "minCompressionLevel", "int"),
@@ -40,11 +41,15 @@ object ZstdCapability {
         Member.instance("ZstdCompressCtx", "setDictID", "ZstdCompressCtx", "boolean"),
         Member.instance("ZstdCompressCtx", "loadDict", "ZstdCompressCtx", "ZstdDictCompress"),
         Member.instance("ZstdCompressCtx", "loadDict", "ZstdCompressCtx", "byte[]"),
-        Member.instance("ZstdCompressCtx", "compress", "byte[]", "byte[]"),
+        Member.instance("ZstdCompressCtx", "reset", "void"),
+        Member.instance(
+            "ZstdCompressCtx", "compressByteArray", "int", "byte[]", "int", "int", "byte[]", "int", "int",
+        ),
         Member.instance("ZstdCompressCtx", "close", "void"),
         Member.constructor("ZstdDecompressCtx"),
         Member.instance("ZstdDecompressCtx", "loadDict", "ZstdDecompressCtx", "ZstdDictDecompress"),
         Member.instance("ZstdDecompressCtx", "loadDict", "ZstdDecompressCtx", "byte[]"),
+        Member.instance("ZstdDecompressCtx", "reset", "void"),
         Member.instance(
             "ZstdDecompressCtx", "decompressByteArray", "int", "byte[]", "int", "int", "byte[]", "int", "int",
         ),

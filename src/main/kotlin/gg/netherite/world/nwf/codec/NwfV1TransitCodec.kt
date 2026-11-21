@@ -28,8 +28,8 @@ object NwfV1TransitCodec : TransitFrameCodec {
         val out = LeWriter(ENVELOPE_BYTES + frame.header.storedLength)
         out.u16(MARKER).u16(VERSION).i32(frame.dataVersion)
         NwfFrameHeaders.write(out, frame.header)
-        out.bytes(frame.payloadView())
-        return ByteBuffer.wrap(out.toByteArray())
+        frame.backing?.let { out.bytes(it) } ?: out.bytes(frame.payloadView())
+        return ByteBuffer.wrap(out.takeByteArray())
     }
 
     override fun fromTransit(buffer: ByteBuffer): EncodedFrame = failClosed("transit frame") {

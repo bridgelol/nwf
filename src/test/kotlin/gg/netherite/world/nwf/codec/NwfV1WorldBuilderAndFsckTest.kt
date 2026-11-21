@@ -81,6 +81,9 @@ class NwfV1WorldBuilderAndFsckTest {
     fun `small worlds are one inline root that reads back exactly`() {
         val world = build(buildOptions(inlineBudget = 16L * 1024 * 1024, dicts = true))
         assertTrue(world.segments.isEmpty())
+        assertArrayEquals(rootCodec.write(world.root), world.rootBytes())
+        assertArrayEquals(world.rootBytes(), world.rootBytesView()?.toBytes())
+        assertTrue(world.rootBytesView()?.isReadOnly == true)
         assertTrue(world.root.entries.all { it.isInline })
         assertEquals("example", world.root.header.contentClass)
         assertEquals(LightPolicy.STRIP, world.root.header.lightPolicy)
@@ -520,5 +523,64 @@ class NwfV1WorldBuilderAndFsckTest {
         assertEquals(listOf(FsckIssueCode.SEGMENT_MISSING), missing.issues.map { it.code })
         assertTrue(missing.corrupt)
         assertTrue(!missing.clean)
+    }
+
+    @Test
+    fun `fsck does not emit ORPHAN_FRAME for a segment frame whose INDEX entry failed entryAt`() {
+        val world = build(buildOptions(inlineBudget = 0, segmentTarget = 256 * 1024))
+        assertEquals(1, world.segments.size)
+        val segmentBytes = world.segments.single().bytes()
+        val entries = world.root.entries
+        assertTrue(entries.size >= 3)
+        // Drop entries[2] so it is a genuine orphan; keep entries[1] in INDEX and patch its codec to unknown.
+        val unknownEntry = entries[1]
+        val orphanEntry = entries[2]
+        val trimmedDraft = world.root.copy(entries = entries.filter { it.key != orphanEntry.key })
+        val rawView = rootCodec.parse(ByteBuffer.wrap(rootCodec.write(trimmedDraft)))
+        val indexSec = rawView.toc.single { it.type == gg.netherite.world.nwf.SectionType.INDEX.id }
+        val indexBody = ByteBuffer.allocate(RootLayout.INDEX_PREFIX + trimmedDraft.entries.size * NwfFormat.INDEX_ENTRY_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        indexBody.putInt(trimmedDraft.entries.size)
+        for (e in trimmedDraft.entries) {
+            val codecByte = if (e.key == unknownEntry.key) 9 else e.codec.id
+            indexBody.putInt(e.x).putInt(e.z).put(e.dim.toByte()).put(e.kind.id.toByte())
+                .put(codecByte.toByte()).put(e.flags.toByte())
+                .putShort(e.location.toShort()).putShort(e.dictSlot.toShort())
+                .putInt(e.offset).putInt(e.storedLength).putInt(e.rawLength).putInt(e.crc32c).putInt(e.dataVersion)
+        }
+        val packedIndex = ZstdSupport.compress(indexBody.array(), 3)
+        val sections = rawView.toc.map { t ->
+            if (t.type == indexSec.type) {
+                RawRoot.Sec(t.type, t.flags, packedIndex, indexBody.capacity())
+            } else {
+                val rootBytes = rootCodec.write(trimmedDraft)
+                RawRoot.Sec(t.type, t.flags, rootBytes.copyOfRange(t.offset.toInt(), (t.offset + t.storedLength).toInt()), t.rawLength.toInt())
+            }
+        }
+        // Also corrupt the segment frame's codec byte (and re-seal segment SHA) so headerAt(offset) would also fail.
+        val patchedSeg = segmentBytes.copyOf().also { it[unknownEntry.offset + 2] = 9 }
+        val patchedSegSha = sha256(patchedSeg)
+        val patchedSegments = RawRoot.assemble(
+            sections.map { s ->
+                if (s.type == gg.netherite.world.nwf.SectionType.SEGMENTS.id) {
+                    val buf = ByteBuffer.allocate(2 + NwfFormat.SEGMENT_ENTRY_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+                    buf.putShort(1)
+                        .put(patchedSegSha.bytes())
+                        .putInt(0)
+                        .putLong(patchedSeg.size.toLong())
+                        .putInt(world.segments.single().frameOffsets.size)
+                    RawRoot.Sec(s.type, s.flags, buf.array(), buf.capacity())
+                } else {
+                    s
+                }
+            },
+        )
+        val report = fsck.check(ByteBuffer.wrap(patchedSegments), fetcher(listOf(patchedSeg)), NO_DICTS)
+        assertEquals(
+            listOf(FsckIssueCode.FRAME_UNDECODABLE, FsckIssueCode.ORPHAN_FRAME),
+            report.issues.map { it.code },
+            report.issues.toString(),
+        )
+        assertEquals(orphanEntry.key, report.issues[1].key)
     }
 }

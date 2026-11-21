@@ -46,18 +46,17 @@ object NwfV1SegmentCodec : NwfSegmentCodec {
         if (total > NwfFormat.MAX_SEGMENT_BYTES) nwfError(NwfFormatError.LIMIT_EXCEEDED, "segment of $total bytes")
         val out = LeWriter(total.toInt())
         out.bytes(NwfFormat.SEGMENT_MAGIC).u16(NwfFormat.MAJOR).u16(NwfFormat.MINOR)
-            .i32(sorted.size).i32(NwfFormat.SEGMENT_FLAG_SORTED).bytes(ByteArray(RESERVED_BYTES))
+            .i32(sorted.size).i32(NwfFormat.SEGMENT_FLAG_SORTED).zeros(RESERVED_BYTES)
         val offsets = LinkedHashMap<ChunkKey, Int>(sorted.size * 2)
         for (frame in sorted) {
             NwfFrameHeaders.checkConsistent(frame.header, "frame ${frame.key}")
             offsets[frame.key] = out.size
             NwfFrameHeaders.write(out, frame.header)
-            out.bytes(frame.payloadView())
+            frame.backing?.let { out.bytes(it) } ?: out.bytes(frame.payloadView())
         }
-        val headerBytes = out.toByteArray().copyOf(NwfFormat.SEGMENT_HEADER_BYTES)
-        out.i32(crc32c(headerBytes))
-        val bytes = out.toByteArray()
-        return WrittenSegment(bytes, sha256(bytes), offsets)
+        out.i32(out.crc32c(0, NwfFormat.SEGMENT_HEADER_BYTES))
+        val bytes = out.takeByteArray()
+        return WrittenSegment(bytes, sha256(bytes), offsets, owned = true)
     }
 
     private fun parseCopy(bytes: ByteArray, expectedSha: Sha256?): NwfV1SegmentView {

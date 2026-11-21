@@ -83,6 +83,14 @@ data class RootDraft(
     val headerLevel: Int? = null,
 )
 
+/** A serialized root together with its verified [RootView]. */
+data class WrittenRoot(val bytes: ByteArray, val view: RootView) {
+    override fun equals(other: Any?): Boolean =
+        this === other || (other is WrittenRoot && bytes.contentEquals(other.bytes) && view == other.view)
+
+    override fun hashCode(): Int = 31 * bytes.contentHashCode() + view.hashCode()
+}
+
 /** Root reader and writer. Pure: no IO, no shared state. */
 interface NwfRootCodec {
     /** Parses and fully verifies a root. Throws only [NwfFormatException]. */
@@ -90,6 +98,15 @@ interface NwfRootCodec {
 
     /** Serializes [draft]; `parse(write(d))` yields the same content. Throws [NwfFormatException] on a limit breach. */
     fun write(draft: RootDraft): ByteArray
+
+    /**
+     * Serializes [draft] and returns both the serialized bytes and a verified [RootView] of them.
+     * Equivalent to `write(draft)` followed by `parse(ByteBuffer.wrap(bytes))`.
+     */
+    fun writeWithView(draft: RootDraft): WrittenRoot {
+        val bytes = write(draft)
+        return WrittenRoot(bytes, parse(ByteBuffer.wrap(bytes)))
+    }
 }
 
 /** One frame inside a segment: [headerOffset] is what an [IndexEntry.offset] stores for it. */
@@ -118,12 +135,25 @@ interface SegmentView {
 }
 
 /** A segment as written: its bytes, id and the header offset of every frame for the new INDEX. */
-class WrittenSegment(bytes: ByteArray, val sha256: Sha256, val frameOffsets: Map<ChunkKey, Int>) {
-    private val content: ByteArray = bytes.copyOf()
-
+class WrittenSegment internal constructor(
+    private val content: ByteArray,
+    val sha256: Sha256,
+    val frameOffsets: Map<ChunkKey, Int>,
+    @Suppress("UNUSED_PARAMETER") owned: Boolean,
+) {
     val length: Long get() = content.size.toLong()
 
+    constructor(bytes: ByteArray, sha256: Sha256, frameOffsets: Map<ChunkKey, Int>) : this(
+        content = bytes.copyOf(),
+        sha256 = sha256,
+        frameOffsets = frameOffsets,
+        owned = true,
+    )
+
     fun bytes(): ByteArray = content.copyOf()
+
+    /** A read-only view of the segment bytes without copying. */
+    fun bytesView(): ByteBuffer = ByteBuffer.wrap(content).asReadOnlyBuffer()
 }
 
 /** Segment reader and writer. Segments are immutable once written; their id is their SHA-256. */

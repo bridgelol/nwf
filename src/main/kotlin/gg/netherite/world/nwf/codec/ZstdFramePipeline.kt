@@ -7,6 +7,7 @@ import gg.netherite.world.nwf.ChunkKind
 import gg.netherite.world.nwf.DictionaryLookup
 import gg.netherite.world.nwf.EncodedFrame
 import gg.netherite.world.nwf.EntryFlags
+import gg.netherite.world.nwf.FilteredNbt
 import gg.netherite.world.nwf.FrameCodec
 import gg.netherite.world.nwf.FrameEncodeOptions
 import gg.netherite.world.nwf.FrameHeader
@@ -37,40 +38,87 @@ class ZstdFramePipeline : FramePipeline, AutoCloseable {
 
     override fun encode(key: ChunkKey, nbt: ByteBuffer, options: FrameEncodeOptions): EncodedFrame {
         checkOptions(options)
-        val scan = LightStripNbtFilter.scan(key.kind, nbt.copyRemaining(), options.lightPolicy, options.heightmapPolicy)
-        checkCoordinates(key, scan)
-        val filtered = scan.filtered.nbtView().copyRemaining()
-        if (filtered.size > NwfFormat.MAX_FRAME_RAW_BYTES) {
-            nwfError(NwfFormatError.LIMIT_EXCEEDED, "$key: ${filtered.size} raw bytes")
+        val scan = LightStripNbtFilter.scan(
+            key.kind,
+            nbt,
+            options.lightPolicy,
+            options.heightmapPolicy,
+            copyIfUnmodified = false,
+        )
+        checkCoordinates(key, scan.x, scan.z)
+        val filtered = scan.filtered
+        val slice = filtered.backing ?: ByteSlice(filtered.nbtView().copyRemaining(), 0, filtered.nbtView().remaining())
+        return encodeSlice(key, slice, filtered.dataVersion, filtered.entryFlags, options, scan.ownsBytes)
+    }
+
+    /**
+     * Encodes an already-filtered [FilteredNbt] (such as from [LightStripNbtFilter.filter]) without re-scanning the
+     * NBT stream. Validates [options], [FilteredNbt.entryFlags], and coordinates carried on [filtered].
+     */
+    override fun encodeFiltered(key: ChunkKey, filtered: FilteredNbt, options: FrameEncodeOptions): EncodedFrame {
+        checkOptions(options)
+        if (filtered.entryFlags and FILTER_FLAGS_MASK.inv() != 0) {
+            nwfError(NwfFormatError.UNKNOWN_FLAGS, "$key: filtered flags ${filtered.entryFlags}")
         }
-        var flags = scan.filtered.entryFlags
+        checkCoordinates(key, filtered.x, filtered.z)
+        val slice = filtered.backing ?: filtered.nbtView().copyRemaining().let { ByteSlice(it, 0, it.size) }
+        return encodeSlice(key, slice, filtered.dataVersion, filtered.entryFlags, options, ownsBytes = false)
+    }
+
+    @Suppress("LongParameterList")
+    private fun encodeSlice(
+        key: ChunkKey,
+        slice: ByteSlice,
+        dataVersion: Int,
+        entryFlags: Int,
+        options: FrameEncodeOptions,
+        ownsBytes: Boolean,
+    ): EncodedFrame {
+        if (slice.length > NwfFormat.MAX_FRAME_RAW_BYTES) {
+            nwfError(NwfFormatError.LIMIT_EXCEEDED, "$key: ${slice.length} raw bytes")
+        }
+        var flags = entryFlags
         var dictSlot = NwfFormat.NONE_U16
         val base = options.baseNbt
         val dictionary = options.dictionary
         val (codec, payload) = failClosed("encode $key") {
             when {
                 options.raw -> {
-                    FrameCodec.RAW to filtered
+                    val rawBytes = if (ownsBytes && slice.offset == 0 && slice.length == slice.array.size) {
+                        slice.array
+                    } else {
+                        slice.copy()
+                    }
+                    FrameCodec.RAW to rawBytes
                 }
                 base != null -> {
                     flags = flags or EntryFlags.BASE_DELTA
+                    val baseBytes = base.toExactByteArrayOrCopy()
                     FrameCodec.ZSTD_BASE_DELTA to
-                        ZstdSupport.compressWithRawContent(filtered, options.level, base.copyRemaining())
+                        ZstdSupport.compressWithRawContent(
+                            slice.array,
+                            options.level,
+                            baseBytes,
+                            slice.offset,
+                            slice.length,
+                        )
                 }
                 dictionary != null -> {
                     dictSlot = options.dictSlot
                     val digested = compressDict(dictionary, options.level)
-                    FrameCodec.ZSTD_DICT to ZstdSupport.compress(filtered, options.level, digested)
+                    FrameCodec.ZSTD_DICT to
+                        ZstdSupport.compress(slice.array, options.level, digested, slice.offset, slice.length)
                 }
                 else -> {
-                    FrameCodec.ZSTD to ZstdSupport.compress(filtered, options.level)
+                    FrameCodec.ZSTD to
+                        ZstdSupport.compress(slice.array, options.level, slice.offset, slice.length)
                 }
             }
         }
         val header = FrameHeader(
             codec = codec,
             flags = flags,
-            rawLength = filtered.size,
+            rawLength = slice.length,
             storedLength = payload.size,
             crc32c = crc32c(payload),
             x = key.x,
@@ -79,31 +127,48 @@ class ZstdFramePipeline : FramePipeline, AutoCloseable {
             kind = key.kind,
             dictSlot = dictSlot,
         )
-        return EncodedFrame(header, scan.filtered.dataVersion, ByteBuffer.wrap(payload))
+        return EncodedFrame(header, dataVersion, ByteBuffer.wrap(payload))
     }
 
     override fun decode(frame: EncodedFrame, dictionaries: DictionaryLookup, baseNbt: ByteBuffer?): ByteBuffer {
         val h = frame.header
         val what = "frame ${h.key}"
         NwfFrameHeaders.checkConsistent(h, what)
-        val payload = frame.payloadView().copyRemaining()
-        if (crc32c(payload) != h.crc32c) nwfError(NwfFormatError.CRC_MISMATCH, "$what payload CRC32C")
+        val payload = frame.backing ?: frame.payloadView().copyRemaining().let { ByteSlice(it, 0, it.size) }
+        if (crc32c(payload.array, payload.offset, payload.length) != h.crc32c) {
+            nwfError(NwfFormatError.CRC_MISMATCH, "$what payload CRC32C")
+        }
         val out = failClosed(what) {
             when (h.codec) {
                 FrameCodec.RAW -> {
-                    payload
+                    payload.copy()
                 }
                 FrameCodec.ZSTD -> {
-                    ZstdSupport.decompress(payload, h.rawLength, what)
+                    ZstdSupport.decompress(payload.array, h.rawLength, what, payload.offset, payload.length)
                 }
                 FrameCodec.ZSTD_DICT -> {
                     val dict = dictionaries.bySlot(h.dictSlot)
                         ?: nwfError(NwfFormatError.DANGLING_REFERENCE, "$what: dict slot ${h.dictSlot} unresolved")
-                    ZstdSupport.decompress(payload, h.rawLength, decompressDict(dict), what)
+                    ZstdSupport.decompress(
+                        payload.array,
+                        h.rawLength,
+                        decompressDict(dict),
+                        what,
+                        payload.offset,
+                        payload.length,
+                    )
                 }
                 FrameCodec.ZSTD_BASE_DELTA -> {
                     val base = baseNbt ?: nwfError(NwfFormatError.DANGLING_REFERENCE, "$what: base frame required")
-                    ZstdSupport.decompressWithRawContent(payload, h.rawLength, base.copyRemaining(), what)
+                    val baseBytes = base.toExactByteArrayOrCopy()
+                    ZstdSupport.decompressWithRawContent(
+                        payload.array,
+                        h.rawLength,
+                        baseBytes,
+                        what,
+                        payload.offset,
+                        payload.length,
+                    )
                 }
             }
         }
@@ -131,11 +196,11 @@ class ZstdFramePipeline : FramePipeline, AutoCloseable {
     }
 
     /** CHUNK and ENTITIES coordinates must match the key. POI record positions are accepted wherever they lie. */
-    private fun checkCoordinates(key: ChunkKey, scan: NbtScan) {
+    private fun checkCoordinates(key: ChunkKey, nbtX: Int?, nbtZ: Int?) {
         val checked = key.kind == ChunkKind.CHUNK || key.kind == ChunkKind.ENTITIES
-        val mismatch = (scan.x != null && scan.x != key.x) || (scan.z != null && scan.z != key.z)
+        val mismatch = (nbtX != null && nbtX != key.x) || (nbtZ != null && nbtZ != key.z)
         if (checked && mismatch) {
-            nwfError(NwfFormatError.BAD_PAYLOAD, "$key: NBT carries coordinates (${scan.x}, ${scan.z})")
+            nwfError(NwfFormatError.BAD_PAYLOAD, "$key: NBT carries coordinates ($nbtX, $nbtZ)")
         }
     }
 
@@ -150,5 +215,9 @@ class ZstdFramePipeline : FramePipeline, AutoCloseable {
     private fun verifiedBytes(dict: NwfDictionary): ByteArray {
         if (!dict.verified()) nwfError(NwfFormatError.SHA_MISMATCH, "dictionary ${dict.sha256}: bytes differ")
         return dict.bytes()
+    }
+
+    private companion object {
+        const val FILTER_FLAGS_MASK = EntryFlags.LIGHT_STRIPPED or EntryFlags.HEIGHTMAPS_STRIPPED
     }
 }

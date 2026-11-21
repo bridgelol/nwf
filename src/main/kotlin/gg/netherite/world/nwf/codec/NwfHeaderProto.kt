@@ -58,6 +58,46 @@ internal object NwfHeaderProto {
     /** Unknown (newer-minor) fields kept per HEADER; far above any real use, low enough to bound decoding. */
     const val MAX_UNKNOWN_FIELDS: Int = 1024
 
+    /**
+     * Validates fields checked on decode (UUID size and unknown-field count/wire lengths) and returns sorted unknown
+     * fields.
+     */
+    fun normalizeForView(header: WorldHeader): WorldHeader {
+        if (header.worldUuidBytes.isNotEmpty() && header.worldUuidBytes.size != UUID_BYTES) {
+            invalid("world_uuid of ${header.worldUuidBytes.size} bytes, not 0 or 16")
+        }
+        if (header.dimensions.size > MAX_DIMENSIONS) invalid("more than $MAX_DIMENSIONS dimensions")
+        if (header.unknownFields.size > MAX_UNKNOWN_FIELDS) invalid("more than $MAX_UNKNOWN_FIELDS unknown fields")
+        var sorted = true
+        for (i in header.unknownFields.indices) {
+            val field = header.unknownFields[i]
+            validateUnknownField(field)
+            if (i > 0 && header.unknownFields[i - 1].number > field.number) sorted = false
+        }
+        return if (sorted) header else header.copy(unknownFields = header.unknownFields.sortedBy { it.number })
+    }
+
+    private fun validateUnknownField(field: HeaderField) {
+        val raw = field.value()
+        when (field.wireType) {
+            HeaderField.I64 -> {
+                if (raw.size != I64_BYTES) invalid("field ${field.number}: I64 has ${raw.size} bytes")
+            }
+            HeaderField.I32 -> {
+                if (raw.size != I32_BYTES) invalid("field ${field.number}: I32 has ${raw.size} bytes")
+            }
+            HeaderField.VARINT -> {
+                if (raw.isEmpty() || raw.size > MAX_VARINT_BYTES) {
+                    invalid("field ${field.number}: varint of ${raw.size} bytes")
+                }
+                for (i in 0 until raw.size - 1) {
+                    if (raw[i].toInt() and CONTINUATION == 0) invalid("field ${field.number}: trailing varint bytes")
+                }
+                if (raw[raw.size - 1].toInt() and CONTINUATION != 0) invalid("field ${field.number}: truncated varint")
+            }
+        }
+    }
+
     fun encode(header: WorldHeader): ByteArray {
         val known = ByteArrayOutputStream()
         val out = Writer(known)

@@ -23,7 +23,7 @@ java {
 }
 
 dependencies {
-    api("com.github.luben:zstd-jni:1.5.7-24")
+    api("com.github.luben:zstd-jni:1.5.7-25")
 
     testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")

@@ -37,10 +37,13 @@ class ZstdCapabilityTest {
     @Test
     fun `an older Zstd without the frame-size methods is refused, naming each one`() {
         val report = ZstdCapability.inspect { name -> if (name == zstd) OldZstd::class.java else Class.forName(name) }
-        // getFrameContentSize exists on the stand-in but returns int: a different descriptor, so it does not link.
-        assertEquals(listOf("Zstd.getFrameContentSize(byte[])", "Zstd.findFrameCompressedSize(byte[])"), report.missing)
+        // getFrameContentSize exists on the stand-in without slice parameters and returns int: a different descriptor.
+        assertEquals(
+            listOf("Zstd.getFrameContentSize(byte[], int, int)", "Zstd.findFrameCompressedSize(byte[], int, int)"),
+            report.missing,
+        )
         val refusal = checkNotNull(report.refusal)
-        assertTrue(refusal.contains("Zstd.findFrameCompressedSize(byte[])"), refusal)
+        assertTrue(refusal.contains("Zstd.findFrameCompressedSize(byte[], int, int)"), refusal)
         assertTrue(refusal.startsWith("zstd-jni "), refusal)
     }
 
@@ -72,10 +75,12 @@ class ZstdCapabilityTest {
         assertTrue(packed in 1 until 64 * 1024, "compressed size $packed")
     }
 
-    /** zstd-jni 1.4.8's static surface as NWF sees it, with getFrameContentSize at a different return type. */
+    /** zstd-jni 1.4.8's static surface as NWF sees it, with getFrameContentSize at a different signature. */
     @Suppress("UnusedParameter", "FunctionOnlyReturningConstant")
     object OldZstd {
         @JvmStatic fun getFrameContentSize(src: ByteArray): Int = 0
+
+        @JvmStatic fun compressBound(srcSize: Long): Long = srcSize
 
         @JvmStatic fun isError(code: Long): Boolean = false
 

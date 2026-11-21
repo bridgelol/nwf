@@ -111,16 +111,63 @@ class WorldHeader(
         heightmapPolicy, converter, sourceUserData, segmentPrefix, saveId, unknownFields,
     )
 
-    private fun fields(): List<Any?> = listOf(
-        meta.toList(), worldUuidBytes.toList(), worldPdc.toList(), levelState?.toList(), dataVersion, writer, originId,
-        legacyEtag, contentDigest.toList(), contentClass, parentRootSha.toList(), createdAtMs, committedAtMs,
-        dimensions, baseRootSha.toList(), baseKey, lightPolicy, heightmapPolicy, converter, sourceUserData.toList(),
-        segmentPrefix, saveId, unknownFields,
-    )
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is WorldHeader) return false
+        return dataVersion == other.dataVersion &&
+            originId == other.originId &&
+            createdAtMs == other.createdAtMs &&
+            committedAtMs == other.committedAtMs &&
+            lightPolicy == other.lightPolicy &&
+            heightmapPolicy == other.heightmapPolicy &&
+            writer == other.writer &&
+            legacyEtag == other.legacyEtag &&
+            contentClass == other.contentClass &&
+            baseKey == other.baseKey &&
+            converter == other.converter &&
+            segmentPrefix == other.segmentPrefix &&
+            saveId == other.saveId &&
+            dimensions == other.dimensions &&
+            unknownFields == other.unknownFields &&
+            meta.contentEquals(other.meta) &&
+            worldUuidBytes.contentEquals(other.worldUuidBytes) &&
+            worldPdc.contentEquals(other.worldPdc) &&
+            nullableContentEquals(levelState, other.levelState) &&
+            contentDigest.contentEquals(other.contentDigest) &&
+            parentRootSha.contentEquals(other.parentRootSha) &&
+            baseRootSha.contentEquals(other.baseRootSha) &&
+            sourceUserData.contentEquals(other.sourceUserData)
+    }
 
-    override fun equals(other: Any?): Boolean = other is WorldHeader && fields() == other.fields()
+    override fun hashCode(): Int {
+        var result = meta.contentHashCode()
+        result = 31 * result + worldUuidBytes.contentHashCode()
+        result = 31 * result + worldPdc.contentHashCode()
+        result = 31 * result + (levelState?.contentHashCode() ?: 0)
+        result = 31 * result + dataVersion
+        result = 31 * result + writer.hashCode()
+        result = 31 * result + originId
+        result = 31 * result + (legacyEtag?.hashCode() ?: 0)
+        result = 31 * result + contentDigest.contentHashCode()
+        result = 31 * result + contentClass.hashCode()
+        result = 31 * result + parentRootSha.contentHashCode()
+        result = 31 * result + createdAtMs.hashCode()
+        result = 31 * result + committedAtMs.hashCode()
+        result = 31 * result + dimensions.hashCode()
+        result = 31 * result + baseRootSha.contentHashCode()
+        result = 31 * result + baseKey.hashCode()
+        result = 31 * result + lightPolicy.hashCode()
+        result = 31 * result + heightmapPolicy.hashCode()
+        result = 31 * result + converter.hashCode()
+        result = 31 * result + sourceUserData.contentHashCode()
+        result = 31 * result + segmentPrefix.hashCode()
+        result = 31 * result + saveId.hashCode()
+        result = 31 * result + unknownFields.hashCode()
+        return result
+    }
 
-    override fun hashCode(): Int = fields().hashCode()
+    private fun nullableContentEquals(a: ByteArray?, b: ByteArray?): Boolean =
+        if (a == null) b == null else b != null && a.contentEquals(b)
 
     override fun toString(): String =
         "WorldHeader(contentClass=$contentClass, dimensions=$dimensions, dataVersion=$dataVersion, writer=$writer, " +

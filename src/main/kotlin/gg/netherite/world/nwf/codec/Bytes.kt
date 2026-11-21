@@ -33,6 +33,13 @@ internal inline fun <T> failClosed(what: String, block: () -> T): T =
         throw NwfFormatException(reason, "$what: ${e.javaClass.simpleName}: ${e.message}", e)
     }
 
+/** Borrowed slice of a [ByteArray]: `[offset, offset + length)`. */
+internal class ByteSlice(val array: ByteArray, val offset: Int, val length: Int) {
+    fun copy(): ByteArray = array.copyOfRange(offset, offset + length)
+
+    fun toExactByteArray(): ByteArray = if (offset == 0 && length == array.size) array else copy()
+}
+
 /** Copies the remaining bytes of [buffer] (position untouched) into a new array. */
 internal fun ByteBuffer.copyRemaining(): ByteArray {
     val view = duplicate()
@@ -40,6 +47,14 @@ internal fun ByteBuffer.copyRemaining(): ByteArray {
     view.get(out)
     return out
 }
+
+/** Array-backed slice of [ByteBuffer]'s remaining bytes without copying, or null when read-only or direct. */
+internal fun ByteBuffer.arraySliceOrNull(): ByteSlice? =
+    if (hasArray()) ByteSlice(array(), arrayOffset() + position(), remaining()) else null
+
+/** Returns [ByteBuffer]'s backing array directly when it matches remaining bytes, else a copy. */
+internal fun ByteBuffer.toExactByteArrayOrCopy(): ByteArray =
+    if (hasArray() && arrayOffset() + position() == 0 && remaining() == array().size) array() else copyRemaining()
 
 internal fun ByteArray.littleEndian(): ByteBuffer = ByteBuffer.wrap(this).order(ByteOrder.LITTLE_ENDIAN)
 
@@ -112,11 +127,28 @@ internal class LeWriter(initialCapacity: Int = 256) {
         buffer.put(value, offset, length)
     }
 
+    fun bytes(slice: ByteSlice): LeWriter = bytes(slice.array, slice.offset, slice.length)
+
     fun bytes(value: ByteBuffer): LeWriter = apply {
         val view = value.duplicate()
         ensure(view.remaining())
         buffer.put(view)
     }
 
+    fun zeros(count: Int): LeWriter = apply {
+        ensure(count)
+        repeat(count) { buffer.put(0) }
+    }
+
+    fun crc32c(offset: Int, length: Int): Int = crc32c(buffer.array(), offset, length)
+
+    fun patchInt(offset: Int, value: Int) {
+        buffer.putInt(offset, value)
+    }
+
     fun toByteArray(): ByteArray = buffer.array().copyOf(buffer.position())
+
+    /** Returns the backing array directly when the written bytes fill it; caller must not use the writer afterwards. */
+    fun takeByteArray(): ByteArray =
+        if (buffer.position() == buffer.capacity()) buffer.array() else buffer.array().copyOf(buffer.position())
 }

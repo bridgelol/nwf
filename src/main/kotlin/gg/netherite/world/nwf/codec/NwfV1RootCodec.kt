@@ -16,8 +16,10 @@ import gg.netherite.world.nwf.SegmentRef
 import gg.netherite.world.nwf.Sha256
 import gg.netherite.world.nwf.TocEntry
 import gg.netherite.world.nwf.WorldHeader
+import gg.netherite.world.nwf.WrittenRoot
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.zip.CRC32C
 
 /**
  * Root writer settings. [sectionLevel] compresses INDEX (always zstd, no dictionary), and HEADER and STATS when that
@@ -64,6 +66,8 @@ class NwfV1RootCodec(private val options: RootCodecOptions = RootCodecOptions())
     }
 
     override fun write(draft: RootDraft): ByteArray = RootWriter(draft, options).write()
+
+    override fun writeWithView(draft: RootDraft): WrittenRoot = RootWriter(draft, options).writeWithView()
 
     companion object {
         /** The HEADER section body for [header]. */
@@ -560,6 +564,12 @@ class NwfV1RootView internal constructor(
         )
     }
 
+    /** Raw `(location, offset)` of INDEX position [i], available even when [entryAt] fails on an unknown codec. */
+    internal fun rawLocationAt(i: Int): Pair<Int, Int> {
+        val base = RootLayout.INDEX_PREFIX + i * NwfFormat.INDEX_ENTRY_BYTES
+        return index.u16(base + RootLayout.E_LOCATION) to index.u32(base + RootLayout.E_OFFSET).toInt()
+    }
+
     private fun search(dim: Int, kind: Int, x: Int, z: Int): Int {
         var lo = 0
         var hi = entryCount - 1
@@ -595,7 +605,49 @@ class NwfV1RootView internal constructor(
 private class RootWriter(private val draft: RootDraft, private val options: RootCodecOptions) {
     private class Section(val type: SectionType, val flags: Int, val stored: ByteArray, val rawLength: Int)
 
+    private class BuiltSections(
+        val sections: List<Section>,
+        val indexBytes: ByteArray,
+        val statsBytes: ByteArray?,
+    )
+
+    private class AssembledRoot(val bytes: ByteArray, val toc: List<TocEntry>?)
+
     fun write(): ByteArray {
+        validateDraft()
+        val inline = draft.inline.copyRemaining()
+        checkEntries(inline)
+        val built = buildSections(inline)
+        return assemble(built.sections, collectToc = false).bytes
+    }
+
+    fun writeWithView(): WrittenRoot {
+        validateDraft()
+        val viewHeader = failClosed("HEADER") { NwfHeaderProto.normalizeForView(draft.header) }
+        val inline = draft.inline.copyRemaining()
+        checkEntries(inline)
+        val built = buildSections(inline)
+        val assembled = assemble(built.sections, collectToc = true)
+        val bytes = assembled.bytes
+        val view = NwfV1RootView(
+            minor = NwfFormat.MINOR,
+            flags = draft.flags,
+            generation = draft.generation,
+            header = viewHeader,
+            dictionaries = draft.dictionaries.toList(),
+            segments = draft.segments.toList(),
+            entryCount = draft.entries.size,
+            rootSha = sha256(bytes),
+            storedLength = bytes.size.toLong(),
+            index = ByteBuffer.wrap(built.indexBytes).asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN),
+            inline = ByteBuffer.wrap(inline).asReadOnlyBuffer(),
+            toc = checkNotNull(assembled.toc),
+            stats = built.statsBytes,
+        )
+        return WrittenRoot(bytes, view)
+    }
+
+    private fun validateDraft() {
         if (draft.flags and NwfFormat.ROOT_FLAGS_KNOWN.inv() != 0) {
             nwfError(NwfFormatError.UNKNOWN_FLAGS, "root flags ${draft.flags}")
         }
@@ -607,10 +659,6 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
         if (draft.entries.size.toLong() >= NwfFormat.MAX_ENTRIES) {
             nwfError(NwfFormatError.LIMIT_EXCEEDED, "${draft.entries.size} entries")
         }
-        val inline = draft.inline.copyRemaining()
-        checkEntries(inline)
-        val sections = buildSections(inline)
-        return assemble(sections)
     }
 
     private fun checkEntries(inline: ByteArray) {
@@ -657,27 +705,31 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
         if (!ok) nwfError(NwfFormatError.OUT_OF_BOUNDS, "draft entry $i: a field exceeds its width")
     }
 
-    private fun buildSections(inline: ByteArray): List<Section> = buildList {
+    private fun buildSections(inline: ByteArray): BuiltSections {
         val headerLevel = draft.headerLevel ?: options.sectionLevel
         if (headerLevel !in ZstdSupport.levels) nwfError(NwfFormatError.OUT_OF_BOUNDS, "headerLevel $headerLevel")
-        add(smallerOf(SectionType.HEADER, 0, NwfV1RootCodec.encodeHeader(draft.header), headerLevel))
-        if (draft.dictionaries.isNotEmpty()) {
-            val w = LeWriter(RootLayout.LIST_PREFIX + draft.dictionaries.size * NwfFormat.DICT_ENTRY_BYTES)
-            w.u16(draft.dictionaries.size)
-            for (d in draft.dictionaries) w.i32(d.zstdDictId).bytes(d.sha256.bytes())
-            add(raw(SectionType.DICTS, w.toByteArray()))
+        val indexBytes = indexBody()
+        val statsCopy = draft.stats?.copyOf()
+        val sections = buildList {
+            add(smallerOf(SectionType.HEADER, 0, NwfV1RootCodec.encodeHeader(draft.header), headerLevel))
+            if (draft.dictionaries.isNotEmpty()) {
+                val w = LeWriter(RootLayout.LIST_PREFIX + draft.dictionaries.size * NwfFormat.DICT_ENTRY_BYTES)
+                w.u16(draft.dictionaries.size)
+                for (d in draft.dictionaries) w.i32(d.zstdDictId).bytes(d.sha256.bytes())
+                add(raw(SectionType.DICTS, w.takeByteArray()))
+            }
+            if (draft.segments.isNotEmpty()) {
+                val w = LeWriter(RootLayout.LIST_PREFIX + draft.segments.size * NwfFormat.SEGMENT_ENTRY_BYTES)
+                w.u16(draft.segments.size)
+                for (s in draft.segments) w.bytes(s.sha256.bytes()).i32(s.salt).i64(s.length).i32(s.frameCount)
+                add(raw(SectionType.SEGMENTS, w.takeByteArray()))
+            }
+            val packedIndex = ZstdSupport.compress(indexBytes, options.sectionLevel)
+            add(Section(SectionType.INDEX, NwfFormat.TOC_FLAG_ZSTD, packedIndex, indexBytes.size))
+            if (inline.isNotEmpty()) add(inlineSection(inline))
+            statsCopy?.let { add(smallerOf(SectionType.STATS, NwfFormat.TOC_FLAG_OPTIONAL, it, headerLevel)) }
         }
-        if (draft.segments.isNotEmpty()) {
-            val w = LeWriter(RootLayout.LIST_PREFIX + draft.segments.size * NwfFormat.SEGMENT_ENTRY_BYTES)
-            w.u16(draft.segments.size)
-            for (s in draft.segments) w.bytes(s.sha256.bytes()).i32(s.salt).i64(s.length).i32(s.frameCount)
-            add(raw(SectionType.SEGMENTS, w.toByteArray()))
-        }
-        val index = indexBody()
-        val packedIndex = ZstdSupport.compress(index, options.sectionLevel)
-        add(Section(SectionType.INDEX, NwfFormat.TOC_FLAG_ZSTD, packedIndex, index.size))
-        if (inline.isNotEmpty()) add(inlineSection(inline))
-        draft.stats?.let { add(smallerOf(SectionType.STATS, NwfFormat.TOC_FLAG_OPTIONAL, it.copyOf(), headerLevel)) }
+        return BuiltSections(sections, indexBytes, statsCopy)
     }
 
     private fun raw(type: SectionType, body: ByteArray) = Section(type, 0, body, body.size)
@@ -718,10 +770,10 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
                 .u16(e.location).u16(e.dictSlot)
                 .i32(e.offset).i32(e.storedLength).i32(e.rawLength).i32(e.crc32c).i32(e.dataVersion)
         }
-        return w.toByteArray()
+        return w.takeByteArray()
     }
 
-    private fun assemble(sections: List<Section>): ByteArray {
+    private fun assemble(sections: List<Section>, collectToc: Boolean): AssembledRoot {
         val tocEnd = NwfFormat.ROOT_HEADER_BYTES + sections.size * NwfFormat.TOC_ENTRY_BYTES
         val total = tocEnd.toLong() + sections.sumOf { it.stored.size.toLong() }
         if (total > NwfFormat.MAX_ROOT_BYTES) nwfError(NwfFormatError.LIMIT_EXCEEDED, "root of $total bytes")
@@ -729,29 +781,42 @@ private class RootWriter(private val draft: RootDraft, private val options: Root
         if (rawTotal > NwfFormat.MAX_ROOT_RAW_BYTES) {
             nwfError(NwfFormatError.LIMIT_EXCEEDED, "sections decode to $rawTotal bytes in all")
         }
-        val toc = LeWriter(sections.size * NwfFormat.TOC_ENTRY_BYTES)
-        var offset = tocEnd.toLong()
-        for (s in sections) {
-            toc.u16(s.type.id).u16(s.flags).u16(NwfFormat.NONE_U16).u16(0)
-                .i32(crc32c(s.stored)).i32(s.rawLength).i64(offset).i64(s.stored.size.toLong())
-            offset += s.stored.size
-        }
-        val tocBytes = toc.toByteArray()
-        val prefix = LeWriter(RootLayout.OFF_HEADER_CRC)
+        val out = LeWriter(total.toInt())
             .bytes(NwfFormat.ROOT_MAGIC)
             .u16(NwfFormat.MAJOR)
             .u16(NwfFormat.MINOR)
             .i32(draft.flags)
             .i32(sections.size)
             .i64(draft.generation)
-            .toByteArray()
-        val headerCrc = java.util.zip.CRC32C().apply {
-            update(prefix)
-            update(tocBytes)
-        }.value.toInt()
-        val out = LeWriter(total.toInt()).bytes(prefix).i32(headerCrc).i32(0).bytes(tocBytes)
+            .i32(0)
+            .i32(0)
+        val toc = if (collectToc) ArrayList<TocEntry>(sections.size) else null
+        var offset = tocEnd.toLong()
+        for (s in sections) {
+            val crc = crc32c(s.stored)
+            out.u16(s.type.id).u16(s.flags).u16(NwfFormat.NONE_U16).u16(0)
+                .i32(crc).i32(s.rawLength).i64(offset).i64(s.stored.size.toLong())
+            toc?.add(
+                TocEntry(
+                    type = s.type.id,
+                    flags = s.flags,
+                    dictSlot = NwfFormat.NONE_U16,
+                    crc32c = crc,
+                    rawLength = s.rawLength.toLong() and U32_MASK,
+                    offset = offset,
+                    storedLength = s.stored.size.toLong(),
+                ),
+            )
+            offset += s.stored.size
+        }
         for (s in sections) out.bytes(s.stored)
-        return out.toByteArray()
+        val bytes = out.takeByteArray()
+        val headerCrc = CRC32C().apply {
+            update(bytes, 0, RootLayout.OFF_HEADER_CRC)
+            update(bytes, NwfFormat.ROOT_HEADER_BYTES, tocEnd - NwfFormat.ROOT_HEADER_BYTES)
+        }.value.toInt()
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(RootLayout.OFF_HEADER_CRC, headerCrc)
+        return AssembledRoot(bytes, toc)
     }
 }
 

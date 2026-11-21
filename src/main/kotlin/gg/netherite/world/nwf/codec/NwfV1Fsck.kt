@@ -81,11 +81,16 @@ class NwfV1Fsck(
         }
         val run = CheckRun(dictionaries, base, view.dictionaries)
         val bySegment = HashMap<Int, MutableList<IndexEntry>>()
+        val damagedSegmentOffsets = HashMap<Int, MutableSet<Int>>()
         for (i in 0 until view.entryCount) {
             val entry = try {
                 view.entryAt(i)
             } catch (e: NwfFormatException) {
                 run.issue(FsckIssueCode.FRAME_UNDECODABLE, null, "INDEX entry $i: ${e.message}")
+                val (location, offset) = view.rawLocationAt(i)
+                if (location != NwfFormat.NONE_U16) {
+                    damagedSegmentOffsets.getOrPut(location) { HashSet() } += offset
+                }
                 continue
             }
             when {
@@ -95,7 +100,7 @@ class NwfV1Fsck(
             }
         }
         for ((i, ref) in view.segments.withIndex()) {
-            run.checkSegment(i, ref, segments, bySegment[i].orEmpty())
+            run.checkSegment(i, ref, segments, bySegment[i].orEmpty(), damagedSegmentOffsets[i].orEmpty())
         }
         return FsckReport(view.entryCount, run.decoded, run.issues.toList())
     }
@@ -163,7 +168,13 @@ class NwfV1Fsck(
             issues += FsckIssue(code, key, detail)
         }
 
-        fun checkSegment(index: Int, ref: SegmentRef, fetcher: SegmentFetcher, entries: List<IndexEntry>) {
+        fun checkSegment(
+            index: Int,
+            ref: SegmentRef,
+            fetcher: SegmentFetcher,
+            entries: List<IndexEntry>,
+            excludedOffsets: Set<Int> = emptySet(),
+        ) {
             val bytes = try {
                 fetcher.fetch(index, ref)
             } catch (e: IOException) {
@@ -203,7 +214,7 @@ class NwfV1Fsck(
                 checkSegmentFrame(segment, index, entry)
             }
             for (offset in segment.headerOffsets()) {
-                if (offset in referenced) continue
+                if (offset in referenced || offset in excludedOffsets) continue
                 val key = runCatching { segment.headerAt(offset).key }.getOrNull()
                 issue(FsckIssueCode.ORPHAN_FRAME, key, "segment $index frame at $offset is in no INDEX entry")
             }
@@ -230,16 +241,12 @@ class NwfV1Fsck(
                 return
             }
             if (entry.codec == FrameCodec.ZSTD_DICT) {
-                when (val outcome = slots.getOrPut(entry.dictSlot) { resolve(entry.dictSlot) }) {
-                    is DictOutcome.Found -> {
-                        Unit
-                    }
-                    is DictOutcome.NotUsable -> {
-                        val sha = dictionaryRefs.getOrNull(entry.dictSlot)?.sha256
-                        val detail = "dictionary slot ${entry.dictSlot} (${sha ?: "undefined"}): ${outcome.detail}"
-                        issues += FsckIssue(outcome.code, entry.key, detail, sha)
-                        return
-                    }
+                val outcome = slots.getOrPut(entry.dictSlot) { resolve(entry.dictSlot) }
+                if (outcome is DictOutcome.NotUsable) {
+                    val sha = dictionaryRefs.getOrNull(entry.dictSlot)?.sha256
+                    val detail = "dictionary slot ${entry.dictSlot} (${sha ?: "undefined"}): ${outcome.detail}"
+                    issues += FsckIssue(outcome.code, entry.key, detail, sha)
+                    return
                 }
             }
             var baseNbt: ByteBuffer? = null

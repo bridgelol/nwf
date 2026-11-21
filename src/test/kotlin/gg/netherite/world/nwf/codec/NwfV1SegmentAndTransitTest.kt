@@ -49,6 +49,14 @@ class NwfV1SegmentAndTransitTest {
         }
         assertArrayEquals(bytes, NwfV1SegmentCodec.write(frames).bytes())
         assertArrayEquals(NwfFormat.SEGMENT_MAGIC, bytes.copyOf(4))
+
+        val viewBuf = written.bytesView()
+        assertTrue(viewBuf.isReadOnly)
+        assertArrayEquals(bytes, viewBuf.toBytes())
+        // Mutating the defensive bytes() copy must not mutate bytesView() or future bytes() calls.
+        bytes[0] = 0
+        assertArrayEquals(NwfFormat.SEGMENT_MAGIC, written.bytes().copyOf(4))
+        assertArrayEquals(NwfFormat.SEGMENT_MAGIC, written.bytesView().toBytes().copyOf(4))
     }
 
     @Test

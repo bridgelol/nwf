@@ -10,6 +10,7 @@ import gg.netherite.world.nwf.NwfFormatException
 import gg.netherite.world.nwf.WorldHeader
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -159,5 +160,67 @@ class NwfHeaderProtoTest {
         val tooManyUnknown =
             assertThrows<NwfFormatException> { NwfV1RootCodec.decodeHeader(hex.parseHex(unknown.repeat(1025))) }
         assertEquals(NwfFormatError.INVALID_HEADER, tooManyUnknown.reason)
+    }
+
+    @Test
+    fun `WorldHeader equals and hashCode compare byte array contents and every field`() {
+        val a = full()
+        val b = WorldHeader(
+            meta = byteArrayOf(1, 2),
+            worldUuidBytes = WorldHeader.uuidBytes(UUID(1, 2)),
+            worldPdc = byteArrayOf(3),
+            levelState = byteArrayOf(0x52, 0x00),
+            dataVersion = 4_440,
+            writer = "writer/1",
+            originId = 1,
+            legacyEtag = "\"etag\"",
+            contentDigest = ByteArray(32) { 7 },
+            contentClass = "class-a",
+            parentRootSha = ByteArray(32) { 8 },
+            createdAtMs = 1_700_000_000_000,
+            committedAtMs = 1_700_000_000_123,
+            dimensions = listOf("minecraft:overworld", "minecraft:the_nether"),
+            baseRootSha = ByteArray(32) { 9 },
+            baseKey = "base/a",
+            lightPolicy = LightPolicy.STRIP,
+            heightmapPolicy = HeightmapPolicy.STRIP,
+            converter = "conv/1",
+            sourceUserData = byteArrayOf(5, 6, 7),
+            segmentPrefix = "prefix",
+            saveId = "save-1",
+        )
+        assertEquals(a, b)
+        assertEquals(a.hashCode(), b.hashCode())
+        assertNotEquals(WorldHeader(levelState = null), WorldHeader(levelState = ByteArray(0)))
+
+        val variants = listOf(
+            a.copy(meta = byteArrayOf(1, 3)),
+            a.copy(worldUuidBytes = WorldHeader.uuidBytes(UUID(1, 3))),
+            a.copy(worldPdc = byteArrayOf(4)),
+            a.copy(levelState = byteArrayOf(0x52, 0x01)),
+            a.copy(levelState = null),
+            a.copy(dataVersion = 4_441),
+            a.copy(writer = "writer/2"),
+            a.copy(originId = 2),
+            a.copy(legacyEtag = null),
+            a.copy(contentDigest = ByteArray(32) { 6 }),
+            a.copy(contentClass = "class-b"),
+            a.copy(parentRootSha = ByteArray(32) { 5 }),
+            a.copy(createdAtMs = 1_700_000_000_001),
+            a.copy(committedAtMs = 1_700_000_000_124),
+            a.copy(dimensions = listOf("minecraft:overworld")),
+            a.copy(baseRootSha = ByteArray(32) { 10 }),
+            a.copy(baseKey = "base/b"),
+            a.copy(lightPolicy = LightPolicy.KEEP),
+            a.copy(heightmapPolicy = HeightmapPolicy.KEEP),
+            a.copy(converter = "conv/2"),
+            a.copy(sourceUserData = byteArrayOf(5, 6, 8)),
+            a.copy(segmentPrefix = "prefix-2"),
+            a.copy(saveId = "save-2"),
+            a.copy(unknownFields = listOf(HeaderField(99, HeaderField.VARINT, byteArrayOf(1)))),
+        )
+        for ((index, variant) in variants.withIndex()) {
+            assertNotEquals(a, variant, "variant $index should differ")
+        }
     }
 }
