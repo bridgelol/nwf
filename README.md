@@ -21,7 +21,7 @@ The byte format is specified in [SPEC.md](SPEC.md).
 
 ## Status
 
-0.1, draft format. The format may change before 1.0. Version 1 roots and segments written by this release are
+0.4.0. The format may change before 1.0. Version 1 roots and segments written by this release are
 covered by golden-file tests in `src/test/resources/nwf/`.
 
 ## Requirements
