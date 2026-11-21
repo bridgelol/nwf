@@ -123,6 +123,21 @@ frame's chunk is a warning (`POI_RECORD_OUTSIDE_CHUNK`): the world is not clean 
 recovers a lost index from segments verified against their SHA-256, cross-checking every CHUNK and ENTITIES frame's
 NBT coordinates against its header; it refuses worlds with a base, whose deletions only the index holds.
 
+## Performance
+
+Measured sequentially on JDK 25 (`v0.3.0` → `v0.4.0`) across 25 KiB synthetic Minecraft chunk NBT (484-chunk world, 5.08 MiB segments, zstd level 3), median wall-clock time and exact JVM thread allocations (`ThreadMXBean`):
+
+| Operation | v0.3.0 | v0.4.0 | Speedup | v0.3.0 alloc | v0.4.0 alloc | Alloc Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| `WorldHeader.equals` (50k calls, ~5 KiB header) | 1,224.6 ms | 6.9 ms | **177.5×** | 2,059.9 MiB | **0 B** | **-100.0%** |
+| `WorldHeader.hashCode` (50k calls, ~5 KiB header) | 789.8 ms | 23.0 ms | **34.3×** | 1,026.9 MiB | **0 B** | **-100.0%** |
+| `NwfV1SegmentCodec.write` (250 frames, 5.08 MiB seg) | 3.41 ms | 3.17 ms | **1.08×** | 20.45 MiB | 5.17 MiB | **-74.7%** |
+| `ZstdFramePipeline.encode` (200×25 KiB, KEEP, L3) | 9.80 ms | 8.49 ms | **1.15×** | 15.70 MiB | 5.93 MiB | **-62.2%** |
+| `ZstdFramePipeline.encode` (200×25 KiB, STRIP, L3) | 11.41 ms | 9.61 ms | **1.19×** | 18.33 MiB | 10.92 MiB | **-40.4%** |
+| `NwfV1WorldBuilderFactory` build + root bytes (484 chunks) | 27.11 ms | 24.73 ms | **1.10×** | 64.51 MiB | 34.47 MiB | **-46.6%** |
+| `ZstdFramePipeline.decode` (200×25 KiB, STRIP, L3) | 3.25 ms | 3.20 ms | **1.02×** | 3.49 MiB | 2.64 MiB | **-24.1%** |
+| `ZstdFramePipeline.decode` (200×25 KiB, KEEP, L3) | 3.27 ms | 3.21 ms | **1.02×** | 5.86 MiB | 5.01 MiB | **-14.6%** |
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
